@@ -27,18 +27,6 @@
   register: baseline_package_transaction
   changed_when: "'there is nothing to do' not in baseline_package_transaction.stdout"
 
-- name: Remove packages excluded from the approved host baseline
-  community.general.pacman:
-    name:
-      - podman
-      - podman-compose
-      - zsh
-      - zsh-autocomplete
-      - zsh-autosuggestions
-      - zsh-completions
-      - zsh-syntax-highlighting
-    state: absent
-
 - name: Reconcile the root-owned BootNext maintenance helper
   ansible.builtin.copy:
     src: "{{ boot_next_installer_file }}"
