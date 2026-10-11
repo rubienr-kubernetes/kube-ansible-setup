@@ -1,0 +1,17 @@
+---
+- name: Prepare one node for a later separately authorized kubeadm stage
+  hosts: "{{ target_node | default('none') }}"
+  gather_facts: false
+  remote_user: root
+  become: false
+  pre_tasks:
+    - name: Require explicit Kubernetes node-preparation authorization
+      ansible.builtin.assert:
+        that:
+          - prepare_kubernetes_node_execute | default(false) | bool
+        fail_msg: >-
+          Kubernetes node preparation installs a runtime and Kubernetes
+          packages. It remains locked and never runs kubeadm init or join.
+  roles:
+    - role: kubernetes_node
+

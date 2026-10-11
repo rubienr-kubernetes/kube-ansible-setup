@@ -1,0 +1,12 @@
+[crio]
+root = "/var/lib/containers/storage"
+storage_driver = "overlay"
+
+[crio.runtime]
+cgroup_manager = "systemd"
+default_runtime = "crun"
+
+{% if kubernetes_pause_image_effective | default('') %}
+[crio.image]
+pause_image = "{{ kubernetes_pause_image_effective }}"
+{% endif %}

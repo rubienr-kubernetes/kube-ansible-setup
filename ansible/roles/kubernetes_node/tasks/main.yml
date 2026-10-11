@@ -1,0 +1,377 @@
+---
+- name: Require the dedicated CRI-O storage subvolume mount
+  ansible.builtin.command:
+    argv: [findmnt, --noheadings, --output, SOURCE, /var/lib/containers/storage]
+  register: crio_storage_mount
+  changed_when: false
+
+- name: Verify the selected CRI-O storage isolation
+  ansible.builtin.assert:
+    that:
+      - "'@cri-o' in crio_storage_mount.stdout"
+    fail_msg: >-
+      CRI-O preparation requires @cri-o mounted at
+      /var/lib/containers/storage; no packages were installed.
+
+- name: Inspect required host prerequisites before package changes
+  block:
+    - name: Inspect active swap
+      ansible.builtin.command:
+        argv: [swapon, --show, --noheadings]
+      register: kubernetes_active_swap
+      changed_when: false
+
+    - name: Inspect cgroup v2
+      ansible.builtin.stat:
+        path: /sys/fs/cgroup/cgroup.controllers
+      register: kubernetes_cgroup_v2
+
+    - name: Read the running kernel command line
+      ansible.builtin.command:
+        argv: [cat, /proc/cmdline]
+      register: kubernetes_kernel_cmdline
+      changed_when: false
+
+    - name: Require the approved host prerequisites
+      ansible.builtin.assert:
+        that:
+          - kubernetes_active_swap.stdout | trim | length == 0
+          - kubernetes_cgroup_v2.stat.exists
+          - "'ipv6.disable=1' in kubernetes_kernel_cmdline.stdout.split()"
+        fail_msg: >-
+          Kubernetes preparation requires no active swap, cgroup v2, and the
+          approved early-boot IPv6 disablement. No packages were changed.
+
+- name: Prepare and validate the Kubernetes runtime
+  block:
+    - name: Upgrade the complete Arch system and install the current runtime tuple
+      ansible.builtin.command:
+        argv:
+          - pacman
+          - --sync
+          - --refresh
+          - --sysupgrade
+          - --needed
+          - --noconfirm
+          - cri-o
+          - crictl
+          - crun
+          - kubeadm
+          - kubectl
+          - kubelet
+      changed_when: true
+
+    - name: Configure Kubernetes kernel modules
+      ansible.builtin.template:
+        src: kubernetes.conf.j2
+        dest: /etc/modules-load.d/kubernetes.conf
+        mode: '0644'
+
+    - name: Load Kubernetes kernel modules
+      community.general.modprobe:
+        name: "{{ item }}"
+        state: present
+      loop:
+        - overlay
+        - br_netfilter
+
+    - name: Configure Kubernetes CRI sysctls
+      ansible.builtin.template:
+        src: 99-kubernetes-cri.conf.j2
+        dest: /etc/sysctl.d/99-kubernetes-cri.conf
+        mode: '0644'
+
+    - name: Apply Kubernetes CRI sysctls
+      ansible.builtin.command:
+        argv: [sysctl, --system]
+      changed_when: true
+
+    - name: Create CRI-O configuration directory
+      ansible.builtin.file:
+        path: /etc/crio/crio.conf.d
+        state: directory
+        mode: '0755'
+
+    - name: Install initial reviewed CRI-O configuration
+      ansible.builtin.template:
+        src: 20-kubernetes.conf.j2
+        dest: /etc/crio/crio.conf.d/20-kubernetes.conf
+        mode: '0644'
+
+    - name: Configure crictl for CRI-O
+      ansible.builtin.template:
+        src: crictl.yaml.j2
+        dest: /etc/crictl.yaml
+        mode: '0644'
+
+    - name: Keep kubelet stopped until a separately authorized kubeadm stage
+      ansible.builtin.systemd_service:
+        name: kubelet.service
+        enabled: false
+        state: stopped
+
+    - name: Enable and start CRI-O for image discovery
+      ansible.builtin.systemd_service:
+        name: crio.service
+        enabled: true
+        state: restarted
+
+    - name: Read the installed Kubernetes version
+      ansible.builtin.command:
+        argv: [kubeadm, version, --output, short]
+      register: kubernetes_installed_version
+      changed_when: false
+
+    - name: Ask kubeadm for its expected image set
+      ansible.builtin.command:
+        argv:
+          - kubeadm
+          - config
+          - images
+          - list
+          - --kubernetes-version
+          - "{{ kubernetes_installed_version.stdout | trim }}"
+      register: kubernetes_expected_images
+      changed_when: false
+
+    - name: Select kubeadm's expected pause image tag
+      ansible.builtin.set_fact:
+        kubernetes_pause_image_tags: >-
+          {{ kubernetes_expected_images.stdout_lines |
+             select('match', '^registry\.k8s\.io/pause:[0-9A-Za-z._-]+$') |
+             list }}
+
+    - name: Require exactly one kubeadm pause image tag
+      ansible.builtin.assert:
+        that:
+          - kubernetes_pause_image_tags | length == 1
+        fail_msg: >-
+          kubeadm did not report exactly one canonical registry.k8s.io pause
+          image; runtime preparation stopped before pinning an image.
+
+    - name: Pull kubeadm's expected pause image through CRI-O
+      ansible.builtin.command:
+        argv: [crictl, pull, "{{ kubernetes_pause_image_tags[0] }}"]
+      changed_when: true
+
+    - name: Inspect the pulled pause image
+      ansible.builtin.command:
+        argv:
+          - crictl
+          - inspecti
+          - --output
+          - json
+          - "{{ kubernetes_pause_image_tags[0] }}"
+      register: kubernetes_pause_image_inspect
+      changed_when: false
+
+    - name: Collect the immutable pause image repository digests
+      ansible.builtin.set_fact:
+        kubernetes_pause_repo_digests: >-
+          {{ ((kubernetes_pause_image_inspect.stdout | from_json).status.repoDigests |
+              default([])) |
+             select('match', '^registry\.k8s\.io/pause@sha256:[0-9a-f]{64}$') |
+             list }}
+
+    - name: Read the pause tag's registry index digest
+      ansible.builtin.uri:
+        url: >-
+          https://registry.k8s.io/v2/pause/manifests/{{
+          kubernetes_pause_image_tags[0].split(':') | last }}
+        method: GET
+        headers:
+          Accept: >-
+            application/vnd.oci.image.index.v1+json,
+            application/vnd.docker.distribution.manifest.list.v2+json
+        follow_redirects: all
+        return_content: false
+        status_code: 200
+      register: kubernetes_pause_registry_manifest
+
+    - name: Require CRI-O and the registry to agree on the index digest
+      ansible.builtin.assert:
+        that:
+          - kubernetes_pause_registry_manifest.docker_content_digest | default('') is match('^sha256:[0-9a-f]{64}$')
+          - >-
+            'registry.k8s.io/pause@' ~
+            kubernetes_pause_registry_manifest.docker_content_digest in
+            kubernetes_pause_repo_digests
+        fail_msg: >-
+          The registry index digest for kubeadm's pause image was absent or
+          was not among CRI-O's canonical repository digests; runtime
+          preparation stopped before final configuration.
+
+    - name: Build the immutable tagged pause image reference
+      ansible.builtin.set_fact:
+        kubernetes_pause_image_effective: >-
+          {{ kubernetes_pause_image_tags[0] ~ '@' ~
+             kubernetes_pause_registry_manifest.docker_content_digest }}
+
+    - name: Install final digest-pinned CRI-O configuration
+      ansible.builtin.template:
+        src: 20-kubernetes.conf.j2
+        dest: /etc/crio/crio.conf.d/20-kubernetes.conf
+        mode: '0644'
+
+    - name: Restart CRI-O with the immutable pause image
+      ansible.builtin.systemd_service:
+        name: crio.service
+        enabled: true
+        state: restarted
+
+    - name: Read effective CRI-O configuration before reboot
+      ansible.builtin.command:
+        argv: [crio, config]
+      register: kubernetes_crio_config_before_reboot
+      changed_when: false
+
+    - name: Select effective CRI-O settings under test
+      ansible.builtin.set_fact:
+        kubernetes_crio_settings_before_reboot: >-
+          {{ kubernetes_crio_config_before_reboot.stdout_lines |
+             map('trim') |
+             select('match', '^(# )?(storage_driver|cgroup_manager|default_runtime|pause_image) = ') |
+             list }}
+
+    - name: Verify effective CRI-O configuration before reboot
+      ansible.builtin.assert:
+        that:
+          - >-
+            'storage_driver = "overlay"' in kubernetes_crio_settings_before_reboot or
+            '# storage_driver = "overlay"' in kubernetes_crio_settings_before_reboot
+          - >-
+            'cgroup_manager = "systemd"' in kubernetes_crio_settings_before_reboot or
+            '# cgroup_manager = "systemd"' in kubernetes_crio_settings_before_reboot
+          - >-
+            'default_runtime = "crun"' in kubernetes_crio_settings_before_reboot or
+            '# default_runtime = "crun"' in kubernetes_crio_settings_before_reboot
+          - >-
+            'pause_image = "' ~ kubernetes_pause_image_effective ~ '"' in
+            kubernetes_crio_settings_before_reboot
+        fail_msg: >-
+          Effective CRI-O settings did not match the reviewed overlay,
+          systemd-cgroup, crun, and dynamically derived pause-image settings.
+          Relevant effective lines: {{ kubernetes_crio_settings_before_reboot }}
+
+    - name: Read running CRI-O status before reboot
+      ansible.builtin.command:
+        argv: [crio, status, info]
+      register: kubernetes_crio_status_before_reboot
+      changed_when: false
+
+    - name: Verify running CRI-O storage and cgroup state before reboot
+      ansible.builtin.assert:
+        that:
+          - >-
+            kubernetes_crio_status_before_reboot.stdout is
+            regex('(?m)^storage driver: overlay$')
+          - >-
+            kubernetes_crio_status_before_reboot.stdout is
+            regex('(?m)^storage graph root: /var/lib/containers/storage$')
+          - >-
+            kubernetes_crio_status_before_reboot.stdout is
+            regex('(?m)^cgroup driver: systemd$')
+        fail_msg: >-
+          The running CRI-O daemon did not report the reviewed overlay storage,
+          dedicated storage root, and systemd cgroup configuration. Reported
+          status: {{ kubernetes_crio_status_before_reboot.stdout_lines }}
+
+    - name: Verify CRI-O through the selected CRI endpoint before reboot
+      ansible.builtin.command:
+        argv: [crictl, info]
+      changed_when: false
+
+    - name: Reboot unconditionally after the complete Arch transaction
+      ansible.builtin.reboot:
+        reboot_timeout: 600
+        connect_timeout: 10
+        post_reboot_delay: 5
+
+    - name: Verify required modules after reboot
+      ansible.builtin.command:
+        argv: [grep, --fixed-strings, "{{ item }}", /proc/modules]
+      loop:
+        - overlay
+        - br_netfilter
+      changed_when: false
+
+    - name: Read persistent Kubernetes sysctls after reboot
+      ansible.builtin.command:
+        argv: [sysctl, -n, "{{ item }}"]
+      loop:
+        - net.bridge.bridge-nf-call-iptables
+        - net.ipv4.ip_forward
+      register: kubernetes_sysctls_after_reboot
+      changed_when: false
+
+    - name: Require persistent Kubernetes sysctls after reboot
+      ansible.builtin.assert:
+        that:
+          - kubernetes_sysctls_after_reboot.results | map(attribute='stdout') | list == ['1', '1']
+
+    - name: Require CRI-O enabled and running after reboot
+      ansible.builtin.systemd_service:
+        name: crio.service
+        enabled: true
+        state: started
+
+    - name: Require kubelet disabled and stopped after reboot
+      ansible.builtin.systemd_service:
+        name: kubelet.service
+        enabled: false
+        state: stopped
+
+    - name: Verify CRI-O through the selected CRI endpoint after reboot
+      ansible.builtin.command:
+        argv: [crictl, info]
+      changed_when: false
+
+    - name: Verify the digest-pinned pause image remains available
+      ansible.builtin.command:
+        argv: [crictl, inspecti, "{{ kubernetes_pause_image_effective }}"]
+      changed_when: false
+
+    - name: Read installed runtime and Kubernetes package versions
+      ansible.builtin.command:
+        argv: [pacman, --query, "{{ item }}"]
+      loop:
+        - cri-o
+        - crictl
+        - crun
+        - kubeadm
+        - kubectl
+        - kubelet
+      register: kubernetes_installed_packages
+      changed_when: false
+
+    - name: Report the installed runtime baseline
+      ansible.builtin.debug:
+        msg:
+          packages: "{{ kubernetes_installed_packages.results | map(attribute='stdout') | list }}"
+          kubernetes_version: "{{ kubernetes_installed_version.stdout | trim }}"
+          pause_image: "{{ kubernetes_pause_image_effective }}"
+
+  rescue:
+    - name: Leave kubelet safely inactive after preparation failure
+      ansible.builtin.systemd_service:
+        name: kubelet.service
+        enabled: false
+        state: stopped
+      failed_when: false
+
+    - name: Leave CRI-O safely inactive after preparation failure
+      ansible.builtin.systemd_service:
+        name: crio.service
+        enabled: false
+        state: stopped
+      failed_when: false
+
+    - name: Stop after preserving packages, configuration, and runtime storage
+      ansible.builtin.fail:
+        msg: >-
+          Kubernetes preparation failed: {{ ansible_failed_result.msg |
+          default('see the preceding failed task') | regex_replace('\.$', '') }}.
+          kubelet and CRI-O were
+          left stopped and disabled where available. Installed packages,
+          configuration, and /var/lib/containers/storage were preserved for
+          inspection and an idempotent rerun.
