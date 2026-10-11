@@ -1,0 +1,36 @@
+---
+- name: Validate explicit managed Bash users
+  ansible.builtin.assert:
+    that:
+      - managed_bash_users | length > 0
+      - item.name | length > 0
+      - item.home == '/home/' ~ item.name or item.name == 'root' and item.home == '/root'
+    fail_msg: Managed Bash user entries must explicitly pair an account with its home.
+  loop: "{{ managed_bash_users }}"
+
+- name: Read managed Bash account records
+  ansible.builtin.getent:
+    database: passwd
+    key: "{{ item.name }}"
+  loop: "{{ managed_bash_users }}"
+
+- name: Install managed Bash configuration
+  ansible.builtin.template:
+    src: bashrc.j2
+    dest: "{{ item.home }}/.bashrc"
+    owner: "{{ item.name }}"
+    group: "{{ item.name }}"
+    mode: '0644'
+  loop: "{{ managed_bash_users }}"
+
+- name: Install managed Git configuration without inventing identity
+  ansible.builtin.template:
+    src: gitconfig.j2
+    dest: "{{ item.home }}/.gitconfig"
+    owner: "{{ item.name }}"
+    group: "{{ item.name }}"
+    mode: '0600'
+  vars:
+    user_git_name: "{{ item.git_name | default(admin_git_name) }}"
+    user_git_email: "{{ item.git_email | default(admin_git_email) }}"
+  loop: "{{ managed_users }}"

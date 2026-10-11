@@ -1,0 +1,5 @@
+# Managed by Ansible. Include only syntax directories supplied by packages.
+{% for path in nano_syntax_paths %}
+include "{{ path }}/*.nanorc"
+{% endfor %}
+

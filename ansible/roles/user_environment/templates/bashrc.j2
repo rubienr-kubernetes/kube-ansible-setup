@@ -1,0 +1,52 @@
+# Managed by Ansible.
+# If not running interactively, don't do anything
+[[ $- != *i* ]] && return
+
+export HISTSIZE=20000
+export HISTFILESIZE=20000
+
+export EDITOR=nano
+export VISUAL=nano
+
+export LESS='-R'
+export LESSOPEN='| /usr/bin/src-hilite-lesspipe.sh %s'
+
+if [[ ${TERM:-} == linux ]]; then
+    alias ls='lsd --color=auto --icon=never'
+else
+    alias ls='lsd --color=auto'
+fi
+alias ll='lsd -lah'
+alias llg='lsd -lah --git'
+alias lsg='lsd --git'
+
+alias dool='sudo dool -clmsd --disk-util -D {{ install_disk | basename }} -n --top-cpu --top-mem --top-io --top-bio'
+alias g='git'
+alias ramstat='zramctl'
+alias ramdel='sudo swapoff /dev/zram0 && sudo rmmod zram'
+
+export FZF_DEFAULT_OPTS='--ignore-case'
+[[ -r /usr/share/fzf/key-bindings.bash ]] && source /usr/share/fzf/key-bindings.bash
+
+# WARNING: ramget enables swap and conflicts with the approved Kubernetes
+# no-swap policy. It is an operator-only recovery experiment; do not call it on
+# a Kubernetes node unless that policy is explicitly replaced and tested.
+ramget() {
+    local mem_total_kib zram_size_bytes
+    mem_total_kib=$(awk '/^MemTotal:/ { print $2; exit }' /proc/meminfo)
+    [[ $mem_total_kib =~ ^[0-9]+$ ]] || {
+        printf 'Cannot determine MemTotal from /proc/meminfo\n' >&2
+        return 1
+    }
+    zram_size_bytes=$((mem_total_kib * 1024 / 2))
+    sudo modprobe zram || return
+    printf '%s\n' "$zram_size_bytes" | sudo tee /sys/block/zram0/disksize >/dev/null || return
+    sudo mkswap /dev/zram0 || return
+    sudo swapon --priority 100 /dev/zram0
+}
+
+if [[ ${TERM:-} == linux ]]; then
+    PS1='[\u@\h \W]\$ '
+elif command -v starship >/dev/null 2>&1; then
+    eval "$(starship init bash)"
+fi

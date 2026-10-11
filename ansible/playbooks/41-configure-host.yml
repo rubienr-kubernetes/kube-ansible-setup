@@ -1,0 +1,16 @@
+---
+- name: Update explicit managed users without reinstalling nodes
+  hosts: "{{ target_node | default('none') }}"
+  gather_facts: false
+  remote_user: root
+  become: false
+  force_handlers: true
+  pre_tasks:
+    - name: Require explicit host-configuration authorization
+      ansible.builtin.assert:
+        that:
+          - configure_node_execute | default(false) | bool
+        fail_msg: Use the guarded ansible.sh configure-host command.
+  roles:
+    - role: host_configuration
+    - role: user_environment

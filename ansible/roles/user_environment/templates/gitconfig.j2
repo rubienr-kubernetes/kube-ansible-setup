@@ -1,0 +1,11 @@
+# Managed by Ansible.
+{% if user_git_name | length > 0 and user_git_email | length > 0 %}
+[user]
+	name = {{ user_git_name }}
+	email = {{ user_git_email }}
+{% endif %}
+[init]
+	defaultBranch = main
+[pull]
+	ff = only
+

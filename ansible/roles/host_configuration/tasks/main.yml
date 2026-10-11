@@ -1,0 +1,180 @@
+---
+- name: Enforce the IPv4-only host policy
+  block:
+    - name: Install persistent IPv6-disable sysctls
+      ansible.builtin.template:
+        src: 10-kube-ipv4-only.conf.j2
+        dest: /etc/sysctl.d/10-kube-ipv4-only.conf
+        mode: '0644'
+      register: ipv4_only_sysctl_config
+
+    - name: Detect whether the kernel exposes IPv6 sysctls
+      ansible.builtin.stat:
+        path: /proc/sys/net/ipv6/conf/all/disable_ipv6
+      register: ipv6_runtime_sysctl
+
+    - name: Inspect runtime IPv6-disable state when IPv6 exists
+      ansible.builtin.command:
+        argv:
+          - sysctl
+          - -n
+          - net.ipv6.conf.all.disable_ipv6
+          - net.ipv6.conf.default.disable_ipv6
+      register: ipv4_only_runtime_state
+      changed_when: false
+      when: ipv6_runtime_sysctl.stat.exists
+
+    - name: Apply persistent sysctl configuration when IPv6 exists
+      ansible.builtin.command:
+        argv: [sysctl, --system]
+      changed_when: >-
+        ipv4_only_sysctl_config.changed or
+        ipv4_only_runtime_state.stdout_lines | reject('equalto', '1') | list | length > 0
+      when: ipv6_runtime_sysctl.stat.exists
+
+    - name: Create GRUB defaults drop-in directory
+      ansible.builtin.file:
+        path: /etc/default/grub.d
+        state: directory
+        mode: '0755'
+
+    - name: Disable IPv6 from early boot
+      ansible.builtin.template:
+        src: 10-ipv4-only.cfg.j2
+        dest: /etc/default/grub.d/10-ipv4-only.cfg
+        mode: '0644'
+      register: ipv4_only_grub_config
+
+    - name: Inspect generated GRUB configuration for IPv6 disablement
+      ansible.builtin.command:
+        argv: [grep, --fixed-strings, --quiet, ipv6.disable=1, /boot/grub/grub.cfg]
+      register: ipv4_only_grub_marker
+      changed_when: false
+      failed_when: false
+
+    - name: Rebuild GRUB configuration when IPv6 disablement is pending
+      ansible.builtin.command:
+        argv: [grub-mkconfig, -o, /boot/grub/grub.cfg]
+      when: ipv4_only_grub_config.changed or ipv4_only_grub_marker.rc != 0
+      changed_when: true
+
+    - name: Reconcile IPv4-only network configuration
+      ansible.builtin.template:
+        src: "{{ item }}.j2"
+        dest: "/etc/systemd/network/{{ item }}"
+        mode: '0644'
+      loop:
+        - 20-management.network
+        - 20-cluster.network
+
+- name: Advertise the installed host on IPv4 mDNS
+  block:
+    - name: Install IPv4-only Avahi configuration
+      ansible.builtin.template:
+        src: avahi-daemon.conf.j2
+        dest: /etc/avahi/avahi-daemon.conf
+        mode: '0644'
+      notify: Restart Avahi
+
+    - name: Enable and start Avahi
+      ansible.builtin.systemd_service:
+        name: avahi-daemon.service
+        enabled: true
+        state: started
+
+- name: Keep swap disabled now and after reboot
+  block:
+    - name: Disable active swap devices
+      ansible.builtin.command:
+        argv: [swapoff, --all]
+      changed_when: true
+
+    - name: Remove persistent zram generator configuration
+      ansible.builtin.file:
+        path: /etc/systemd/zram-generator.conf
+        state: absent
+
+    - name: Mask swap target
+      ansible.builtin.systemd_service:
+        name: swap.target
+        masked: true
+        enabled: false
+
+- name: Inspect packaged Nano syntax directories
+  ansible.builtin.stat:
+    path: "{{ item }}"
+  loop:
+    - /usr/share/nano
+    - /usr/share/nano/extra
+    - /usr/share/nano-syntax-highlighting
+  register: nano_syntax_directory_stats
+
+- name: Select only installed Nano syntax directories
+  ansible.builtin.set_fact:
+    nano_syntax_paths: >-
+      {{ nano_syntax_directory_stats.results |
+         selectattr('stat.isdir', 'defined') |
+         selectattr('stat.isdir') |
+         map(attribute='item') | list }}
+
+- name: Require packaged Nano syntax definitions
+  ansible.builtin.assert:
+    that:
+      - "'/usr/share/nano' in nano_syntax_paths"
+      - "'/usr/share/nano-syntax-highlighting' in nano_syntax_paths"
+
+- name: Configure all installed Nano syntax definitions system-wide
+  ansible.builtin.template:
+    src: nanorc.j2
+    dest: /etc/nanorc
+    mode: '0644'
+
+- name: Validate the packaged source-highlight lesspipe helper
+  ansible.builtin.stat:
+    path: /usr/bin/src-hilite-lesspipe.sh
+  register: source_highlight_lesspipe
+
+- name: Require the lesspipe integration used by managed Bash
+  ansible.builtin.assert:
+    that:
+      - source_highlight_lesspipe.stat.executable | default(false)
+
+- name: Configure root-only Snapper snapshots
+  block:
+    - name: Require the separately mounted snapshot subvolume
+      ansible.builtin.command:
+        argv: [findmnt, --noheadings, --output, SOURCE, /.snapshots]
+      register: snapshots_mount
+      changed_when: false
+
+    - name: Confirm snapshots are isolated from root snapshots
+      ansible.builtin.assert:
+        that:
+          - "'@snapshots' in snapshots_mount.stdout"
+
+    - name: Create Snapper configuration directory
+      ansible.builtin.file:
+        path: /etc/snapper/configs
+        state: directory
+        mode: '0755'
+
+    - name: Install root Snapper configuration
+      ansible.builtin.template:
+        src: snapper-root.j2
+        dest: /etc/snapper/configs/root
+        mode: '0644'
+
+    - name: Select only the root Snapper configuration
+      ansible.builtin.template:
+        src: snapper.conf.j2
+        dest: /etc/conf.d/snapper
+        mode: '0644'
+
+    - name: Enable reviewed Snapper timers
+      ansible.builtin.systemd_service:
+        name: "{{ item }}"
+        enabled: true
+        state: started
+      loop:
+        - snapper-timeline.timer
+        - snapper-cleanup.timer
