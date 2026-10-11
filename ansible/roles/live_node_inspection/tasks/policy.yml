@@ -1,0 +1,18 @@
+---
+- name: Enforce inventory and disk policy after reporting
+  ansible.builtin.assert:
+    that:
+      - live_iso_present.stat.exists | default(false)
+      - live_uefi_present.stat.exists | default(false)
+      - nvme_serial | default('') | length > 0
+      - cluster_mac | default('') | length > 0
+      - inspection_disk.serial | default('') == nvme_serial
+      - inspection_disk.type | default('') == 'disk'
+      - inspection_disk.path | default('') == install_disk
+      - inspection_disk['log-sec'] | int == install_disk_logical_sector_bytes | int
+      - (inspection_disk.size | int) // (inspection_disk['log-sec'] | int) == install_disk_expected_sectors | int
+      - partition3_classification != 'unknown_or_unsafe'
+      - >-
+        not inspection_p3_present | bool or
+        system_end_lba | int < inspection_partition3.start | int
+    fail_msg: The printed inspection report violates installation policy; no write is permitted.

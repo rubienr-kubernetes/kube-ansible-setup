@@ -1,0 +1,709 @@
+---
+- name: Require an explicit installation gate
+  ansible.builtin.assert:
+    that:
+      - install_execute | default(false) | bool
+      - partition3_classification in ['absent', 'blank', 'existing_ceph_osd']
+      - system_end_lba | int < (inspection_partition3.start | default(gpt_last_usable_lba + 1) | int)
+    fail_msg: Installation is locked or disk classification is unsafe.
+
+- name: Display the exact destructive boundary
+  ansible.builtin.debug:
+    msg:
+      target: "{{ install_disk }}"
+      verified_serial: "{{ inspection_disk.serial }}"
+      recreate_only: partitions 1 and 2
+      partition3: "{{ partition3_classification }}"
+      partition3_record: "{{ inspection_partition3 }}"
+
+- name: Require exact per-node installation confirmation
+  ansible.builtin.pause:
+    prompt: >-
+      Type exactly "INSTALL {{ inventory_hostname }} SERIAL {{ nvme_serial }}
+      RECREATE PARTITIONS 1 AND 2"
+  register: install_confirmation
+
+- name: Verify exact installation confirmation
+  ansible.builtin.assert:
+    that:
+      - >-
+        install_confirmation.user_input ==
+        ('INSTALL ' ~ inventory_hostname ~ ' SERIAL ' ~ nvme_serial ~
+         ' RECREATE PARTITIONS 1 AND 2')
+    fail_msg: Confirmation did not match; no disk operation was started.
+
+- name: Create controller artifact directory
+  ansible.builtin.file:
+    path: "{{ playbook_dir }}/../artifacts/{{ inventory_hostname }}"
+    state: directory
+    mode: '0700'
+  delegate_to: localhost
+
+- name: Create private live-environment work directory
+  ansible.builtin.tempfile:
+    state: directory
+    path: /tmp
+    prefix: kube-install-
+  register: install_temp
+
+- name: Preserve GPT and partition 3 evidence
+  block:
+    - name: Back up GPT before touching OS entries
+      ansible.builtin.command:
+        argv: [sgdisk, "--backup={{ install_temp.path }}/gpt-before.bin", "{{ install_disk }}"]
+      changed_when: false
+
+    - name: Fetch GPT backup to controller
+      ansible.builtin.fetch:
+        src: "{{ install_temp.path }}/gpt-before.bin"
+        dest: "{{ playbook_dir }}/../artifacts/{{ inventory_hostname }}/gpt-before.bin"
+        flat: true
+
+    - name: Collect mounts backed by the installation disk
+      ansible.builtin.command:
+        argv: [findmnt, --raw, --noheadings, --output, 'TARGET,SOURCE']
+      register: install_mounts_before
+      changed_when: false
+
+    - name: Classify existing mounts of OS partitions 1 and 2
+      ansible.builtin.set_fact:
+        install_target_mount_lines: >-
+          {{ install_mounts_before.stdout_lines |
+             select('search', '[ \t]' ~ (install_disk | regex_escape) ~ 'p[12](?:[^0-9]|$)') |
+             list }}
+        install_unsafe_target_mount_lines: >-
+          {{ install_mounts_before.stdout_lines |
+             select('search', '[ \t]' ~ (install_disk | regex_escape) ~ 'p[12](?:[^0-9]|$)') |
+             reject('match', '^/mnt(?:[ \t]|/)') |
+             list }}
+
+    - name: Refuse target-partition mounts outside the installer staging tree
+      ansible.builtin.assert:
+        that:
+          - install_unsafe_target_mount_lines | length == 0
+        fail_msg: >-
+          Target OS partitions are mounted outside /mnt; refusing automatic
+          unmount: {{ install_unsafe_target_mount_lines }}
+
+    - name: Mark the installer staging tree safe to own and clean
+      ansible.builtin.set_fact:
+        install_staging_mount_owned: true
+
+    - name: Unmount leftovers from an earlier installer attempt
+      ansible.builtin.command:
+        argv: [umount, --recursive, /mnt]
+      when: install_target_mount_lines | length > 0
+      changed_when: true
+
+    - name: Recheck mounts after staging cleanup
+      ansible.builtin.command:
+        argv: [findmnt, --raw, --noheadings, --output, 'TARGET,SOURCE']
+      register: install_mounts_after_cleanup
+      changed_when: false
+
+    - name: Require OS partitions to be unmounted before partition changes
+      ansible.builtin.assert:
+        that:
+          - >-
+            install_mounts_after_cleanup.stdout_lines |
+            select('search', '[ \t]' ~ (install_disk | regex_escape) ~ 'p[12](?:[^0-9]|$)') |
+            list | length == 0
+
+    - name: Collect firmware entries before installation
+      ansible.builtin.command:
+        argv: [efibootmgr, -v]
+      register: install_efi_before
+      changed_when: false
+
+    - name: Parse firmware entries before cleanup
+      ansible.builtin.set_fact:
+        install_boot_current_matches: >-
+          {{ install_efi_before.stdout |
+             regex_findall('(?im)^BootCurrent:[ \t]*([0-9a-f]{4})[ \t]*\r?$') |
+             map('upper') | list }}
+        install_owned_grub_entries: >-
+          {{ install_efi_before.stdout |
+             regex_findall('(?im)^Boot([0-9a-f]{4})[*]?[ \t]+GRUB(?:[ \t]+|$).*$') |
+             map('upper') | list }}
+
+    - name: Require exactly one BootCurrent record before entry cleanup
+      ansible.builtin.assert:
+        that:
+          - install_boot_current_matches | length == 1
+        fail_msg: Firmware output did not contain exactly one parseable BootCurrent record; no entry or disk change was started.
+
+    - name: Select BootCurrent before entry cleanup
+      ansible.builtin.set_fact:
+        install_boot_current: "{{ install_boot_current_matches | first }}"
+
+    - name: Refuse to delete the currently booted firmware entry
+      ansible.builtin.assert:
+        that:
+          - install_boot_current not in install_owned_grub_entries
+
+    - name: Delete only exact stale GRUB-owned entries
+      ansible.builtin.command:
+        argv: [efibootmgr, --bootnum, "{{ item }}", --delete-bootnum]
+      loop: "{{ install_owned_grub_entries }}"
+      changed_when: true
+
+    - name: Delete existing OS partition entries only
+      ansible.builtin.command:
+        argv: [sgdisk, "--delete={{ item }}", "{{ install_disk }}"]
+      loop:
+        - 1
+        - 2
+      when: >-
+        (inspection_table.partitions |
+         selectattr('node', 'equalto', install_disk ~ 'p' ~ item) |
+         list | length) == 1
+      changed_when: true
+
+    - name: Create exact EFI and system GPT entries
+      ansible.builtin.command:
+        argv:
+          - sgdisk
+          - "--new={{ item.number }}:{{ item.start }}:{{ item.end }}"
+          - "--typecode={{ item.number }}:{{ item.type }}"
+          - "--change-name={{ item.number }}:{{ item.name }}"
+          - "{{ install_disk }}"
+      loop:
+        - {number: 1, start: "{{ efi_start_lba }}", end: "{{ efi_end_lba }}", type: ef00, name: EFI}
+        - {number: 2, start: "{{ system_start_lba }}", end: "{{ system_end_lba }}", type: '8300', name: Arch system}
+      changed_when: true
+
+    - name: Ask kernel to reread GPT
+      ansible.builtin.command:
+        argv: [partprobe, "{{ install_disk }}"]
+      changed_when: true
+
+    - name: Wait for partition devices
+      ansible.builtin.command:
+        argv: [udevadm, settle]
+      changed_when: false
+
+    - name: Format only the EFI filesystem
+      ansible.builtin.command:
+        argv: [mkfs.fat, -F, '32', -n, ARCHBOOT, "{{ install_disk }}p1"]
+      changed_when: true
+
+    - name: Format only the Btrfs system filesystem
+      ansible.builtin.command:
+        argv: [mkfs.btrfs, --force, --label, archroot, "{{ install_disk }}p2"]
+      changed_when: true
+
+    - name: Create installation mountpoint
+      ansible.builtin.file:
+        path: /mnt
+        state: directory
+        mode: '0755'
+
+    - name: Mount top-level Btrfs tree
+      ansible.posix.mount:
+        path: /mnt
+        src: "{{ install_disk }}p2"
+        fstype: btrfs
+        opts: "{{ btrfs_mount_options }}"
+        state: ephemeral
+
+    - name: Create all service-isolating Btrfs subvolumes before pacstrap
+      ansible.builtin.command:
+        argv: [btrfs, subvolume, create, "/mnt/{{ item }}"]
+      loop:
+        - '@'
+        - '@home'
+        - '@log'
+        - '@pkg'
+        - '@containerd'
+        - '@cri-o'
+        - '@kubelet'
+        - '@etcd'
+        - '@snapshots'
+      changed_when: true
+
+    - name: Unmount top-level Btrfs tree
+      ansible.posix.mount:
+        path: /mnt
+        state: unmounted
+
+    - name: Mount root subvolume
+      ansible.posix.mount:
+        path: /mnt
+        src: "{{ install_disk }}p2"
+        fstype: btrfs
+        opts: "{{ btrfs_mount_options }},subvol=@"
+        state: ephemeral
+
+    - name: Create nested mountpoints
+      ansible.builtin.file:
+        path: "/mnt/{{ item.path }}"
+        state: directory
+        mode: '0755'
+      loop:
+        - {path: home}
+        - {path: var/log}
+        - {path: var/cache/pacman/pkg}
+        - {path: var/lib/containerd}
+        - {path: var/lib/containers/storage}
+        - {path: var/lib/kubelet}
+        - {path: var/lib/etcd}
+        - {path: boot}
+        - {path: .snapshots}
+
+    - name: Mount nested subvolumes
+      ansible.posix.mount:
+        path: "/mnt/{{ item.path }}"
+        src: "{{ install_disk }}p2"
+        fstype: btrfs
+        opts: "{{ btrfs_mount_options }},subvol={{ item.subvol }}"
+        state: ephemeral
+      loop:
+        - {path: home, subvol: '@home'}
+        - {path: var/log, subvol: '@log'}
+        - {path: var/cache/pacman/pkg, subvol: '@pkg'}
+        - {path: var/lib/containerd, subvol: '@containerd'}
+        - {path: var/lib/containers/storage, subvol: '@cri-o'}
+        - {path: var/lib/kubelet, subvol: '@kubelet'}
+        - {path: var/lib/etcd, subvol: '@etcd'}
+        - {path: .snapshots, subvol: '@snapshots'}
+
+    - name: Mount EFI system partition
+      ansible.posix.mount:
+        path: /mnt/boot
+        src: "{{ install_disk }}p1"
+        fstype: vfat
+        opts: umask=0077
+        state: ephemeral
+
+    - name: Install pinned-scope base packages
+      ansible.builtin.command:
+        argv:
+          - pacstrap
+          - -K
+          - /mnt
+          - amd-ucode
+          - base
+          - btrfs-progs
+          - dosfstools
+          - efibootmgr
+          - grub
+          - linux
+          - linux-firmware
+          - openssh
+          - python
+          - sudo
+      changed_when: true
+
+    - name: Generate fstab text
+      ansible.builtin.command:
+        argv: [genfstab, -U, /mnt]
+      register: install_fstab
+      changed_when: false
+
+    - name: Install generated fstab as data
+      ansible.builtin.copy:
+        dest: /mnt/etc/fstab
+        content: "{{ install_fstab.stdout }}\n"
+        mode: '0644'
+
+    - name: Render installed-system identity files
+      ansible.builtin.template:
+        src: "{{ item.src }}"
+        dest: "/mnt/{{ item.dest }}"
+        mode: '0644'
+      loop:
+        - {src: hostname.j2, dest: etc/hostname}
+        - {src: vconsole.conf.j2, dest: etc/vconsole.conf}
+        - {src: locale.conf.j2, dest: etc/locale.conf}
+
+    - name: Enable en_US.UTF-8 generation
+      ansible.builtin.lineinfile:
+        path: /mnt/etc/locale.gen
+        regexp: '^#en_US.UTF-8 UTF-8$'
+        line: en_US.UTF-8 UTF-8
+
+    - name: Link installed timezone
+      ansible.builtin.file:
+        src: /usr/share/zoneinfo/Europe/Vienna
+        dest: /mnt/etc/localtime
+        state: link
+        force: true
+
+    - name: Create installed network configuration directory
+      ansible.builtin.file:
+        path: /mnt/etc/systemd/network
+        state: directory
+        mode: '0755'
+
+    - name: Render MAC-matched network configuration
+      ansible.builtin.template:
+        src: "{{ item }}.j2"
+        dest: "/mnt/etc/systemd/network/{{ item }}"
+        mode: '0644'
+      loop:
+        - 10-management.link
+        - 10-cluster.link
+        - 20-management.network
+        - 20-cluster.network
+
+    - name: Create installed IPv4-only configuration directories
+      ansible.builtin.file:
+        path: "/mnt/{{ item }}"
+        state: directory
+        mode: '0755'
+      loop:
+        - etc/sysctl.d
+        - etc/default/grub.d
+
+    - name: Disable IPv6 persistently in the installed system
+      ansible.builtin.copy:
+        dest: /mnt/etc/sysctl.d/10-kube-ipv4-only.conf
+        mode: '0644'
+        content: |
+          # This homelab deliberately operates IPv4-only.
+          -net.ipv6.conf.all.disable_ipv6 = 1
+          -net.ipv6.conf.default.disable_ipv6 = 1
+
+    - name: Disable IPv6 from the installed system's early boot
+      ansible.builtin.copy:
+        dest: /mnt/etc/default/grub.d/10-ipv4-only.cfg
+        mode: '0644'
+        content: |
+          # Appended after /etc/default/grub by grub-mkconfig.
+          GRUB_CMDLINE_LINUX="${GRUB_CMDLINE_LINUX:+${GRUB_CMDLINE_LINUX} }ipv6.disable=1"
+
+    - name: Install temporary key-only root access
+      ansible.posix.authorized_key:
+        user: root
+        key: "{{ lookup('file', installer_public_key_file) }}"
+        path: /mnt/root/.ssh/authorized_keys
+        manage_dir: true
+
+    - name: Install temporary root SSH policy
+      ansible.builtin.copy:
+        src: "{{ archiso_overlay_dir }}/airootfs/etc/ssh/sshd_config.d/00-kube-live.conf"
+        dest: /mnt/etc/ssh/sshd_config.d/00-kube-live.conf
+        mode: '0644'
+
+    - name: Install the root-owned BootNext maintenance helper
+      ansible.builtin.copy:
+        src: "{{ boot_next_installer_file }}"
+        dest: /mnt/root/boot-next-installer.sh
+        owner: root
+        group: root
+        mode: '0755'
+
+    - name: Find the accepted live-session SSH host identity
+      ansible.builtin.find:
+        paths: /etc/ssh
+        recurse: false
+        file_type: file
+        patterns:
+          - 'ssh_host_*_key'
+          - 'ssh_host_*_key.pub'
+      register: install_live_ssh_host_keys
+
+    - name: Require live-session SSH host keys before reboot handoff
+      ansible.builtin.assert:
+        that:
+          - install_live_ssh_host_keys.matched | int >= 2
+        fail_msg: No complete live-session SSH host identity is available for the verified reboot handoff.
+
+    - name: Preserve the accepted SSH host identity in the installed system
+      ansible.builtin.copy:
+        src: "{{ item.path }}"
+        dest: "/mnt/etc/ssh/{{ item.path | basename }}"
+        remote_src: true
+        owner: root
+        group: root
+        mode: "{{ item.mode }}"
+      loop: "{{ install_live_ssh_host_keys.files }}"
+
+    - name: Generate installed locale
+      ansible.builtin.command:
+        argv: [arch-chroot, /mnt, locale-gen]
+      changed_when: true
+
+    - name: Set installed hardware clock from system time
+      ansible.builtin.command:
+        argv: [arch-chroot, /mnt, hwclock, --systohc]
+      changed_when: true
+
+    - name: Build installed initramfs
+      ansible.builtin.command:
+        argv: [arch-chroot, /mnt, mkinitcpio, -P]
+      changed_when: true
+
+    - name: Enable installed services
+      ansible.builtin.command:
+        argv: [arch-chroot, /mnt, systemctl, enable, sshd.service, systemd-networkd.service, systemd-resolved.service, systemd-timesyncd.service]
+      changed_when: true
+
+    - name: Use installed systemd-resolved stub
+      ansible.builtin.file:
+        src: /run/systemd/resolve/stub-resolv.conf
+        dest: /mnt/etc/resolv.conf
+        state: link
+        force: true
+
+    - name: Install GRUB in UEFI mode
+      ansible.builtin.command:
+        argv: [arch-chroot, /mnt, grub-install, --target=x86_64-efi, --efi-directory=/boot, --bootloader-id=GRUB]
+      changed_when: true
+
+    - name: Install firmware-independent GRUB fallback loader
+      ansible.builtin.command:
+        argv: [arch-chroot, /mnt, grub-install, --target=x86_64-efi, --efi-directory=/boot, --removable, --no-nvram]
+      changed_when: true
+
+    - name: Verify both installed GRUB loaders
+      ansible.builtin.stat:
+        path: "{{ item }}"
+      loop:
+        - /mnt/boot/EFI/GRUB/grubx64.efi
+        - /mnt/boot/EFI/BOOT/BOOTX64.EFI
+      register: install_grub_loaders
+
+    - name: Require nonempty normal and fallback GRUB loaders
+      ansible.builtin.assert:
+        that:
+          - item.stat.isreg | default(false)
+          - item.stat.size | default(0) | int > 0
+      loop: "{{ install_grub_loaders.results }}"
+
+    - name: Generate GRUB configuration
+      ansible.builtin.command:
+        argv: [arch-chroot, /mnt, grub-mkconfig, -o, /boot/grub/grub.cfg]
+      changed_when: true
+
+    - name: Reread GPT after installation
+      ansible.builtin.command:
+        argv: [sfdisk, --json, "{{ install_disk }}"]
+      register: install_sfdisk_after
+      changed_when: false
+
+    - name: Select partition 3 record after installation
+      ansible.builtin.set_fact:
+        install_partition3_after: >-
+          {{ (install_sfdisk_after.stdout | from_json).partitiontable.partitions |
+             selectattr('node', 'equalto', install_disk ~ 'p3') |
+             list | first | default({}) }}
+
+    - name: Recollect partition 3 identity after installation
+      ansible.builtin.command:
+        argv: [blkid, --probe, --output, export, "{{ install_disk }}p3"]
+      register: install_p3_blkid_after
+      changed_when: false
+      failed_when: false
+      when: inspection_p3_present
+
+    - name: Prove partition 3 table record and signatures are unchanged
+      ansible.builtin.assert:
+        that:
+          - install_partition3_after == inspection_partition3
+          - install_p3_blkid_after.stdout == inspection_p3_blkid.stdout
+      when: inspection_p3_present
+
+    - name: Read installed ESP PARTUUID
+      ansible.builtin.command:
+        argv: [lsblk, --noheadings, --nodeps, --output, PARTUUID, "{{ install_disk }}p1"]
+      register: install_esp_partuuid
+      changed_when: false
+
+    - name: Define the installed GRUB firmware loader path
+      ansible.builtin.set_fact:
+        install_grub_loader_path: '\EFI\GRUB\grubx64.efi'
+
+    - name: Collect firmware entries after GRUB installation
+      ansible.builtin.command:
+        argv: [efibootmgr, -v]
+      register: install_efi_after_grub
+      changed_when: false
+
+    - name: Find installed GRUB entries after GRUB installation
+      ansible.builtin.set_fact:
+        install_new_grub_entries: >-
+          {{ install_efi_after_grub.stdout |
+             regex_findall('(?im)^Boot([0-9a-f]{4})[*]?[ \t]+GRUB[ \t]+.*' ~
+                           (install_esp_partuuid.stdout | trim | regex_escape) ~
+                           '.*' ~ (install_grub_loader_path | regex_escape) ~ '.*$') |
+             map('upper') | list }}
+
+    - name: Create an explicit new-ESP GRUB entry when grub-install did not
+      ansible.builtin.command:
+        argv:
+          - efibootmgr
+          - --create-only
+          - --disk
+          - "{{ install_disk }}"
+          - --part
+          - '1'
+          - --label
+          - GRUB
+          - --loader
+          - "\\EFI\\GRUB\\grubx64.efi"
+      when: install_new_grub_entries | length == 0
+      changed_when: true
+
+    - name: Recollect firmware entries after explicit entry repair
+      ansible.builtin.command:
+        argv: [efibootmgr, -v]
+      register: install_efi_repaired
+      changed_when: false
+
+    - name: Parse repaired GRUB entries and BootOrder
+      ansible.builtin.set_fact:
+        install_new_grub_entries: >-
+          {{ install_efi_repaired.stdout |
+             regex_findall('(?im)^Boot([0-9a-f]{4})[*]?[ \t]+GRUB[ \t]+.*' ~
+                           (install_esp_partuuid.stdout | trim | regex_escape) ~
+                           '.*' ~ (install_grub_loader_path | regex_escape) ~ '.*$') |
+             map('upper') | list }}
+        install_boot_order_matches: >-
+          {{ install_efi_repaired.stdout |
+             regex_findall('(?im)^BootOrder:[ \t]*([0-9a-f]{4}(?:[ \t]*,[ \t]*[0-9a-f]{4})*)[ \t]*\r?$') |
+             map('upper') | list }}
+
+    - name: Require one new-ESP GRUB entry and one BootOrder record
+      ansible.builtin.assert:
+        that:
+          - install_new_grub_entries | length == 1
+          - install_boot_order_matches | length == 1
+        fail_msg: Firmware did not retain exactly one new-ESP GRUB entry and one parseable BootOrder; the installed system was not rebooted.
+
+    - name: Build the explicit installed-system-first BootOrder
+      ansible.builtin.set_fact:
+        install_new_grub_entry: "{{ install_new_grub_entries | first }}"
+        install_boot_order: >-
+          {{ install_boot_order_matches | first | split(',') |
+             map('trim') | list }}
+
+    - name: Select the installed system first without discarding other entries
+      ansible.builtin.command:
+        argv:
+          - efibootmgr
+          - --bootorder
+          - >-
+            {{ ([install_new_grub_entry] +
+                (install_boot_order | reject('equalto', install_new_grub_entry) | list)) |
+               join(',') }}
+      changed_when: true
+
+    - name: Select the verified installed GRUB entry for the first reboot
+      ansible.builtin.command:
+        argv: [efibootmgr, --bootnext, "{{ install_new_grub_entry }}"]
+      changed_when: true
+
+    - name: Verify installed-system-first BootOrder and one-shot handoff
+      ansible.builtin.command:
+        argv: [efibootmgr, -v]
+      register: install_efi_ordered
+      changed_when: false
+
+    - name: Parse verified installed-system-first BootOrder and BootNext
+      ansible.builtin.set_fact:
+        install_ordered_boot_order_matches: >-
+          {{ install_efi_ordered.stdout |
+             regex_findall('(?im)^BootOrder:[ \t]*([0-9a-f]{4}(?:[ \t]*,[ \t]*[0-9a-f]{4})*)[ \t]*\r?$') |
+             map('upper') | list }}
+        install_ordered_boot_next_matches: >-
+          {{ install_efi_ordered.stdout |
+             regex_findall('(?im)^BootNext:[ \t]*([0-9a-f]{4})[ \t]*\r?$') |
+             map('upper') | list }}
+
+    - name: Enforce installed UEFI-entry ownership, priority, and handoff
+      ansible.builtin.assert:
+        that:
+          - install_ordered_boot_order_matches | length == 1
+          - (install_ordered_boot_order_matches | first | split(',') | map('trim') | first) == install_new_grub_entry
+          - install_ordered_boot_next_matches == [install_new_grub_entry]
+  always:
+    - name: Inspect installer staging mounts before cleanup
+      ansible.builtin.command:
+        argv: [findmnt, --mountpoint, /mnt]
+      register: install_staging_mount_after
+      changed_when: false
+      failed_when: false
+      when: install_staging_mount_owned | default(false) | bool
+
+    - name: Unmount the installer staging tree
+      ansible.builtin.command:
+        argv: [umount, --recursive, /mnt]
+      when:
+        - install_staging_mount_owned | default(false) | bool
+        - install_staging_mount_after.rc | default(1) == 0
+      changed_when: true
+
+    - name: Remove private live-environment work directory
+      ansible.builtin.file:
+        path: "{{ install_temp.path }}"
+        state: absent
+
+- name: Reboot from live ISO into the installed system
+  ansible.builtin.reboot:
+    reboot_timeout: 600
+    connect_timeout: 10
+  when: install_reboot | default(true) | bool
+
+- name: Wait for the installed node
+  ansible.builtin.wait_for_connection:
+    timeout: 600
+  when: install_reboot | default(true) | bool
+
+- name: Verify installed boot and remove obsolete installer entries
+  when: install_reboot | default(true) | bool
+  block:
+    - name: Collect firmware state after installed-system boot
+      ansible.builtin.command:
+        argv: [efibootmgr, -v]
+      register: install_efi_post_boot
+      changed_when: false
+
+    - name: Parse BootCurrent and exact installer entries after boot
+      ansible.builtin.set_fact:
+        install_post_boot_current_matches: >-
+          {{ install_efi_post_boot.stdout |
+             regex_findall('(?im)^BootCurrent:[ \t]*([0-9a-f]{4})[ \t]*\r?$') |
+             map('upper') | list }}
+        install_obsolete_archiso_entries: >-
+          {{ install_efi_post_boot.stdout |
+             regex_findall('(?im)^Boot([0-9a-f]{4})[*]?[ \t]+Kube ArchISO USB[ \t]+.*$') |
+             map('upper') | list }}
+
+    - name: Require the verified installed GRUB entry as BootCurrent
+      ansible.builtin.assert:
+        that:
+          - install_post_boot_current_matches | length == 1
+          - (install_post_boot_current_matches | first) == install_new_grub_entry
+          - install_new_grub_entry not in install_obsolete_archiso_entries
+        fail_msg: The reboot did not return through the verified new-ESP GRUB entry; installer entries were not removed.
+
+    - name: Remove exact obsolete Kube ArchISO USB entries
+      ansible.builtin.command:
+        argv: [efibootmgr, --bootnum, "{{ item }}", --delete-bootnum]
+      loop: "{{ install_obsolete_archiso_entries }}"
+      changed_when: true
+
+    - name: Verify installer-entry cleanup and persistent GRUB priority
+      ansible.builtin.command:
+        argv: [efibootmgr, -v]
+      register: install_efi_final
+      changed_when: false
+
+    - name: Parse final firmware state
+      ansible.builtin.set_fact:
+        install_final_archiso_entries: >-
+          {{ install_efi_final.stdout |
+             regex_findall('(?im)^Boot([0-9a-f]{4})[*]?[ \t]+Kube ArchISO USB[ \t]+.*$') |
+             map('upper') | list }}
+        install_final_boot_order_matches: >-
+          {{ install_efi_final.stdout |
+             regex_findall('(?im)^BootOrder:[ \t]*([0-9a-f]{4}(?:[ \t]*,[ \t]*[0-9a-f]{4})*)[ \t]*\r?$') |
+             map('upper') | list }}
+
+    - name: Require clean installer entries and installed GRUB first
+      ansible.builtin.assert:
+        that:
+          - install_final_archiso_entries | length == 0
+          - install_final_boot_order_matches | length == 1
+          - (install_final_boot_order_matches | first | split(',') | map('trim') | first) == install_new_grub_entry

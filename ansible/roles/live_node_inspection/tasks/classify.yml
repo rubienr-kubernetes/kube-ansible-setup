@@ -1,0 +1,14 @@
+---
+- name: Classify partition 3 without changing it
+  ansible.builtin.set_fact:
+    partition3_classification: >-
+      {%- if not inspection_p3_present | bool -%}
+      absent
+      {%- elif inspection_ceph_recognized | bool -%}
+      existing_ceph_osd
+      {%- elif inspection_signature_types | length == 0 -%}
+      blank
+      {%- else -%}
+      unknown_or_unsafe
+      {%- endif -%}
+

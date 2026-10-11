@@ -1,0 +1,144 @@
+---
+- name: Detect ArchISO environment
+  ansible.builtin.stat:
+    path: /run/archiso
+  register: live_iso_present
+  failed_when: false
+
+- name: Detect UEFI boot mode
+  ansible.builtin.stat:
+    path: /sys/firmware/efi
+  register: live_uefi_present
+  failed_when: false
+
+- name: Collect CPU details
+  ansible.builtin.command:
+    argv: [lscpu, --json]
+  register: inspection_cpu
+  changed_when: false
+  failed_when: false
+
+- name: Collect memory details
+  ansible.builtin.command:
+    argv: [free, --bytes]
+  register: inspection_memory
+  changed_when: false
+  failed_when: false
+
+- name: Collect NIC names, MACs, state, and addresses
+  ansible.builtin.command:
+    argv: [ip, --json, address, show]
+  register: inspection_nics
+  changed_when: false
+  failed_when: false
+
+- name: Collect complete target-disk topology
+  ansible.builtin.command:
+    argv: [lsblk, --bytes, --json, --output-all, "{{ install_disk }}"]
+  register: inspection_lsblk
+  changed_when: false
+  failed_when: false
+
+- name: Collect GPT summary
+  ansible.builtin.command:
+    argv: [sgdisk, --print, "{{ install_disk }}"]
+  register: inspection_gpt
+  changed_when: false
+  failed_when: false
+
+- name: Collect machine-readable partition boundaries
+  ansible.builtin.command:
+    argv: [sfdisk, --json, "{{ install_disk }}"]
+  register: inspection_sfdisk
+  changed_when: false
+  failed_when: false
+
+- name: Parse available disk records
+  ansible.builtin.set_fact:
+    inspection_disk: >-
+      {{ ((inspection_lsblk.stdout | from_json).blockdevices | first)
+         if inspection_lsblk.rc == 0 else {} }}
+    inspection_table: >-
+      {{ (inspection_sfdisk.stdout | from_json).partitiontable
+         if inspection_sfdisk.rc == 0 else {'partitions': []} }}
+
+- name: Select partition 3 record
+  ansible.builtin.set_fact:
+    inspection_partition3: >-
+      {{ inspection_table.partitions |
+         selectattr('node', 'equalto', install_disk ~ 'p3') |
+         list | first | default({}) }}
+
+- name: Record partition 3 presence
+  ansible.builtin.set_fact:
+    inspection_p3_present: "{{ inspection_partition3 | length > 0 }}"
+
+- name: Collect partition 3 filesystem identity
+  ansible.builtin.command:
+    argv: [blkid, --probe, --output, export, "{{ install_disk }}p3"]
+  register: inspection_p3_blkid
+  changed_when: false
+  failed_when: false
+  when: inspection_p3_present
+
+- name: Collect partition 3 signatures without erasing them
+  ansible.builtin.command:
+    argv: [wipefs, --no-act, --json, "{{ install_disk }}p3"]
+  register: inspection_p3_wipefs
+  changed_when: false
+  failed_when: false
+  when: inspection_p3_present
+
+- name: Collect LVM/Ceph physical-volume identity
+  ansible.builtin.command:
+    argv: [pvs, --reportformat, json, --options, pv_name,pv_uuid,vg_name,pv_tags, "{{ install_disk }}p3"]
+  register: inspection_p3_pvs
+  changed_when: false
+  failed_when: false
+  when: inspection_p3_present
+
+- name: Derive non-destructive signature evidence
+  ansible.builtin.set_fact:
+    inspection_signature_types: >-
+      {{ (inspection_p3_wipefs.stdout | default('')) |
+         regex_findall('"type"\\s*:\\s*"([^"]+)"') | unique | list }}
+    inspection_ceph_recognized: >-
+      {{ 'ceph_bluestore' in (inspection_p3_wipefs.stdout | default('') | lower)
+         or 'ceph' in (inspection_p3_pvs.stdout | default('') | lower) }}
+
+- name: Classify observed partition 3
+  ansible.builtin.include_tasks: classify.yml
+
+- name: Print complete inspection report before policy assertions
+  ansible.builtin.debug:
+    msg:
+      live_iso: "{{ live_iso_present.stat.exists | default(false) }}"
+      uefi: "{{ live_uefi_present.stat.exists | default(false) }}"
+      cpu: "{{ inspection_cpu.stdout | default('unavailable', true) }}"
+      memory: "{{ inspection_memory.stdout | default('unavailable', true) }}"
+      nics: "{{ inspection_nics.stdout | default('unavailable', true) }}"
+      disk:
+        path: "{{ inspection_disk.path | default('unavailable') }}"
+        model: "{{ inspection_disk.model | default('unavailable') }}"
+        serial: "{{ inspection_disk.serial | default('unavailable') }}"
+        bytes: "{{ inspection_disk.size | default('unavailable') }}"
+        logical_sector: "{{ inspection_disk['log-sec'] | default('unavailable') }}"
+        physical_sector: "{{ inspection_disk['phy-sec'] | default('unavailable') }}"
+      gpt: "{{ inspection_gpt.stdout | default('unavailable', true) }}"
+      partitions: "{{ inspection_table.partitions | default([]) }}"
+      partition3:
+        record: "{{ inspection_partition3 }}"
+        signatures: "{{ inspection_signature_types }}"
+        blkid: "{{ inspection_p3_blkid.stdout | default('unavailable', true) }}"
+        lvm_ceph: "{{ inspection_p3_pvs.stdout | default('unavailable', true) }}"
+        classification: "{{ partition3_classification }}"
+      inventory_comparison:
+        expected_hostname: "{{ final_hostname }}"
+        expected_management_mac: "{{ management_mac }}"
+        expected_cluster_mac: "{{ cluster_mac | default('MISSING') }}"
+        expected_nvme_serial: "{{ nvme_serial | default('MISSING') }}"
+        serial_matches: "{{ inspection_disk.serial | default('') == nvme_serial | default('') }}"
+
+- name: Run policy assertions only after the report
+  ansible.builtin.include_tasks: policy.yml
+

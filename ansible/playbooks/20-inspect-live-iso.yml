@@ -1,0 +1,8 @@
+---
+- name: Inspect a live-ISO node before any installation assertion
+  hosts: "{{ target_node | default('none') }}"
+  gather_facts: false
+  remote_user: root
+  become: false
+  roles:
+    - role: live_node_inspection

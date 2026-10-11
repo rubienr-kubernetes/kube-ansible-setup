@@ -1,0 +1,9 @@
+---
+- name: Inspect and explicitly install one host from the live ISO
+  hosts: "{{ target_node | default('none') }}"
+  gather_facts: false
+  remote_user: root
+  become: false
+  roles:
+    - role: live_node_inspection
+    - role: arch_install
