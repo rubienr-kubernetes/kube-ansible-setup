@@ -1,0 +1,19 @@
+---
+final_hostname: kube3
+ansible_host: 192.168.2.23
+management_address: 192.168.2.23/24
+management_mac: '04:7b:cb:48:7a:fd'
+cluster_mac: '00:0a:cd:00:12:f6'
+nvme_serial: CS0BT00111190BJ20
+nvme_model: SK hynix BC511
+install_disk: /dev/nvme0n1
+install_disk_logical_sector_bytes: 512
+install_disk_expected_sectors: 1000215216
+gpt_last_usable_lba: 1000215182
+efi_start_lba: 2048
+efi_end_lba: 2099199
+system_start_lba: 2099200
+system_end_lba: 369100799
+ceph_partition_sectors: 631114383
+ceph_start_lba: 369100800
+btrfs_mount_options: noatime,compress=zstd:3,discard=async

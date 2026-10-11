@@ -1,0 +1,84 @@
+---
+ansible_user: kube
+cluster_name: kube
+local_domain: heastmi.net
+archiso_live_hostname: kube-installer
+ceph_partition_type_guid: 4fbd7e29-9d25-41b8-afd0-062c0ceff05d
+ansible_workspace_dir: "{{ ansible_config_file | dirname }}"
+installer_public_key_file: "{{ ansible_workspace_dir }}/files/admin_authorized_keys.pub"
+boot_next_installer_file: "{{ ansible_workspace_dir }}/boot-next-installer.sh"
+archiso_overlay_dir: "{{ ansible_workspace_dir }}/files/archiso"
+archiso_releng_profile: /usr/share/archiso/configs/releng
+archiso_output_dir: "{{ ansible_workspace_dir }}/iso"
+archiso_packages:
+  - ansible-core
+  - arch-install-scripts
+  - avahi
+  - btrfs-progs
+  - dosfstools
+  - efibootmgr
+  - gptfdisk
+  - grub
+  - iproute2
+  - lvm2
+  - openssh
+  - parted
+  - procps-ng
+  - python
+  - rsync
+  - util-linux
+admin_user: kube
+managed_users:
+  - name: "{{ admin_user }}"
+    home: "/home/{{ admin_user }}"
+managed_bash_users:
+  - name: "{{ admin_user }}"
+    home: "/home/{{ admin_user }}"
+  - name: root
+    home: /root
+admin_git_name: ''
+admin_git_email: ''
+host_baseline_packages:
+  - 7zip
+  - avahi
+  - btrfs-progs
+  - dool
+  - ethtool
+  - fwupd
+  - fwupd-efi
+  - fzf
+  - git
+  - gparted
+  - grub-btrfs
+  - htop
+  - iftop
+  - inetutils
+  - inotify-tools
+  - iotop
+  - jq
+  - less
+  - lesspipe
+  - lsd
+  - mtr
+  - nano
+  - nano-syntax-highlighting
+  - nmap
+  - noto-fonts
+  - nvme-cli
+  - parallel
+  - rclone
+  - rsync
+  - smartmontools
+  - snapper
+  - source-highlight
+  - starship
+  - stress
+  - sudo
+  - systemd-resolvconf
+  - tig
+  - traceroute
+  - tree
+  - ttf-nerd-fonts-symbols
+  - unzip
+  - usbutils
+prepare_kubernetes_node_execute: false

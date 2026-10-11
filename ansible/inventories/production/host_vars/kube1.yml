@@ -1,0 +1,19 @@
+---
+final_hostname: kube1
+ansible_host: 192.168.2.21
+management_address: 192.168.2.21/24
+management_mac: '38:7c:76:4a:0f:71'
+cluster_mac: '00:0a:cd:00:10:4f'
+nvme_serial: S3TNNB1K505043
+nvme_model: Samsung MZVLB512HAJQ-000L7
+install_disk: /dev/nvme0n1
+install_disk_logical_sector_bytes: 512
+install_disk_expected_sectors: 1000215216
+gpt_last_usable_lba: 1000215182
+efi_start_lba: 2048
+efi_end_lba: 2099199
+system_start_lba: 2099200
+system_end_lba: 369100799
+ceph_partition_sectors: 631114383
+ceph_start_lba: 369100800
+btrfs_mount_options: noatime,compress=zstd:3,discard=async
