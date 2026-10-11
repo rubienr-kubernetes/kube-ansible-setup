@@ -1,0 +1,177 @@
+---
+- name: Render every active Jinja template with synthetic non-secret values
+  hosts: localhost
+  gather_facts: false
+  vars:
+    final_hostname: kube-test
+    archiso_live_hostname: kube-installer
+    management_mac: '02:00:00:00:00:01'
+    cluster_mac: '02:00:00:00:00:02'
+    admin_user: kube
+    nano_syntax_paths:
+      - /usr/share/nano
+      - /usr/share/nano/extra
+      - /usr/share/nano-syntax-highlighting
+    user_git_name: ''
+    user_git_email: ''
+    cluster_name: kube
+    ansible_host: 192.0.2.10
+    kubernetes_version: v1.37.0
+    kube_api_endpoint: 192.0.2.150
+    kubelet_system_reserved_cpu: 250m
+    kubelet_system_reserved_memory: 512Mi
+    kubelet_kube_reserved_cpu: 250m
+    kubelet_kube_reserved_memory: 512Mi
+    kubelet_eviction_memory: 250Mi
+    kubernetes_pause_image_effective: registry.k8s.io/pause:fixture@sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd
+    install_disk: /dev/nvme0n1
+    rook_ceph_image: registry.example.invalid/ceph@sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee
+    archiso_final_path: /tmp/fixture.iso
+    archiso_iso_checksum:
+      stat:
+        checksum: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+    archiso_version:
+      stdout: archiso 91-1
+    ansible_core_version:
+      stdout: ansible-core 2.21.5-1
+    archiso_releng_profile: /usr/share/archiso/configs/releng
+    archiso_packages_checksum:
+      stat:
+        checksum: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+    boot_next_installer_checksum:
+      stat:
+        checksum: ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff
+    archiso_live_package_versions:
+      results:
+        - stdout: python 3.14.7-1
+    releng_checksums:
+      results:
+        - item:
+            path: /usr/share/archiso/configs/releng/profiledef.sh
+          stat:
+            checksum: cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
+    archiso_overlay_dir: /workspace/ansible/files/archiso
+    overlay_checksums:
+      results:
+        - item:
+            path: /workspace/ansible/files/archiso/airootfs/etc/hostname
+          stat:
+            checksum: dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd
+  tasks:
+    - name: Require the approved cluster inventory topology
+      ansible.builtin.assert:
+        that:
+          - groups['control_plane'] == ['kube1', 'kube2', 'kube3']
+          - groups['etcd'] == ['kube1', 'kube2', 'kube3']
+          - groups['workers'] == ['kube1', 'kube2', 'kube3', 'kube4', 'kube5']
+          - ansible_workspace_dir == (ansible_config_file | dirname)
+          - archiso_output_dir == (ansible_config_file | dirname) ~ '/iso'
+
+    - name: Require complete per-host hardware and disk identity
+      ansible.builtin.assert:
+        that:
+          - hostvars[item].cluster_mac is match('^([0-9a-f]{2}:){5}[0-9a-f]{2}$')
+          - hostvars[item].nvme_serial | length > 0
+          - hostvars[item].install_disk is match('^/dev/')
+          - hostvars[item].install_disk_logical_sector_bytes | int > 0
+          - hostvars[item].install_disk_expected_sectors | int > 0
+          - hostvars[item].gpt_last_usable_lba | int < hostvars[item].install_disk_expected_sectors | int
+          - hostvars[item].efi_start_lba | int <= hostvars[item].efi_end_lba | int
+          - hostvars[item].efi_end_lba | int < hostvars[item].system_start_lba | int
+          - hostvars[item].system_start_lba | int <= hostvars[item].system_end_lba | int
+          - hostvars[item].system_end_lba | int < hostvars[item].ceph_start_lba | int
+          - hostvars[item].ceph_start_lba | int <= hostvars[item].gpt_last_usable_lba | int
+          - hostvars[item].ceph_partition_sectors | int == (hostvars[item].gpt_last_usable_lba | int - hostvars[item].ceph_start_lba | int + 1)
+          - hostvars[item].btrfs_mount_options | length > 0
+      loop: "{{ groups['kube_nodes'] }}"
+
+    - name: Create private render directory
+      ansible.builtin.tempfile:
+        state: directory
+        path: /tmp
+        prefix: kube-template-render-
+      register: template_temp
+
+    - name: Render configuration templates
+      block:
+        - name: Render each template
+          ansible.builtin.template:
+            src: "{{ playbook_dir }}/../{{ item.src }}"
+            dest: "{{ template_temp.path }}/{{ item.dest }}"
+            mode: '0600'
+          loop:
+            - {src: roles/archiso_build/templates/hostname.j2, dest: live-hostname}
+            - {src: roles/archiso_build/templates/build-manifest.txt.j2, dest: build-manifest}
+            - {src: roles/arch_install/templates/hostname.j2, dest: hostname}
+            - {src: roles/arch_install/templates/vconsole.conf.j2, dest: vconsole.conf}
+            - {src: roles/arch_install/templates/locale.conf.j2, dest: locale.conf}
+            - {src: roles/arch_install/templates/10-management.link.j2, dest: 10-management.link}
+            - {src: roles/arch_install/templates/10-cluster.link.j2, dest: 10-cluster.link}
+            - {src: roles/arch_install/templates/20-management.network.j2, dest: 20-management.network}
+            - {src: roles/arch_install/templates/20-cluster.network.j2, dest: 20-cluster.network}
+            - {src: roles/host_configuration/templates/nanorc.j2, dest: nanorc}
+            - {src: roles/host_configuration/templates/10-kube-ipv4-only.conf.j2, dest: ipv4-only-sysctl.conf}
+            - {src: roles/host_configuration/templates/10-ipv4-only.cfg.j2, dest: ipv4-only-grub.cfg}
+            - {src: roles/host_configuration/templates/20-management.network.j2, dest: configured-management.network}
+            - {src: roles/host_configuration/templates/20-cluster.network.j2, dest: configured-cluster.network}
+            - {src: roles/host_configuration/templates/avahi-daemon.conf.j2, dest: avahi-daemon.conf}
+            - {src: roles/host_configuration/templates/snapper-root.j2, dest: snapper-root}
+            - {src: roles/host_configuration/templates/snapper.conf.j2, dest: snapper.conf}
+            - {src: roles/kubernetes_node/templates/20-kubernetes.conf.j2, dest: crio.conf}
+            - {src: roles/kubernetes_node/templates/crictl.yaml.j2, dest: crictl.yaml}
+            - {src: roles/kubernetes_node/templates/kubernetes.conf.j2, dest: modules.conf}
+            - {src: roles/kubernetes_node/templates/99-kubernetes-cri.conf.j2, dest: sysctl.conf}
+            - {src: roles/host_baseline/templates/sudoers-kube.j2, dest: sudoers}
+            - {src: roles/host_baseline/templates/10-kube-hardening.conf.j2, dest: sshd.conf}
+            - {src: roles/host_baseline/templates/05-root-maintenance.conf.j2, dest: root-maintenance.conf}
+            - {src: roles/host_baseline/templates/manage-root-ssh-access.sh.j2, dest: manage-root-ssh-access}
+            - {src: roles/kubernetes_node/templates/kubeadm-init.yaml.j2, dest: kubeadm.yaml}
+            - {src: roles/user_environment/templates/bashrc.j2, dest: bashrc}
+            - {src: roles/user_environment/templates/gitconfig.j2, dest: gitconfig}
+            - {src: roles/osd_partition_inspection/templates/ceph-label-job.yml.j2, dest: ceph-label-job.yml}
+
+        - name: Parse rendered Bash
+          ansible.builtin.command:
+            argv: [bash, -n, "{{ template_temp.path }}/bashrc"]
+          changed_when: false
+
+        - name: Parse rendered root-SSH access manager
+          ansible.builtin.command:
+            argv: [bash, -n, "{{ template_temp.path }}/manage-root-ssh-access"]
+          changed_when: false
+
+        - name: Read rendered generic live hostname
+          ansible.builtin.slurp:
+            src: "{{ template_temp.path }}/live-hostname"
+          register: rendered_live_hostname
+
+        - name: Require the generic live hostname
+          ansible.builtin.assert:
+            that:
+              - rendered_live_hostname.content | b64decode | trim == archiso_live_hostname
+
+        - name: Read rendered kubeadm multi-document YAML
+          ansible.builtin.slurp:
+            src: "{{ template_temp.path }}/kubeadm.yaml"
+          register: rendered_kubeadm
+
+        - name: Parse and validate rendered kubeadm documents
+          ansible.builtin.assert:
+            that:
+              - (rendered_kubeadm.content | b64decode | from_yaml_all | list) | length == 3
+
+        - name: Read rendered Ceph label Job YAML
+          ansible.builtin.slurp:
+            src: "{{ template_temp.path }}/ceph-label-job.yml"
+          register: rendered_ceph_label_job
+
+        - name: Parse and validate rendered Ceph label Job
+          ansible.builtin.assert:
+            that:
+              - (rendered_ceph_label_job.content | b64decode | from_yaml).kind == 'Job'
+              - (rendered_ceph_label_job.content | b64decode | from_yaml).spec.template.spec.volumes[0].hostPath.type == 'BlockDevice'
+      always:
+        - name: Remove private render directory
+          ansible.builtin.file:
+            path: "{{ template_temp.path }}"
+            state: absent

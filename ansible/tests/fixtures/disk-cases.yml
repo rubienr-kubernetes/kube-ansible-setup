@@ -1,0 +1,23 @@
+---
+classification_cases:
+  - name: absent
+    present: false
+    signatures: []
+    ceph: false
+    expected: absent
+  - name: blank
+    present: true
+    signatures: []
+    ceph: false
+    expected: blank
+  - name: valid-ceph
+    present: true
+    signatures: [LVM2_member]
+    ceph: true
+    expected: existing_ceph_osd
+  - name: unknown-signature
+    present: true
+    signatures: [ext4]
+    ceph: false
+    expected: unknown_or_unsafe
+

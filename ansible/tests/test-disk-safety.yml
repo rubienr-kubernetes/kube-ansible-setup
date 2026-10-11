@@ -1,0 +1,189 @@
+---
+- name: Exercise disk classification and policy fixtures
+  hosts: localhost
+  gather_facts: false
+  vars_files:
+    - fixtures/disk-cases.yml
+  tasks:
+    - name: Run each classification fixture
+      ansible.builtin.include_tasks: ../roles/live_node_inspection/tasks/classify.yml
+      vars:
+        inspection_p3_present: "{{ item.present }}"
+        inspection_signature_types: "{{ item.signatures }}"
+        inspection_ceph_recognized: "{{ item.ceph }}"
+      loop: "{{ classification_cases }}"
+      register: classification_runs
+
+    - name: Re-run and assert each classification independently
+      ansible.builtin.include_tasks: test-one-classification.yml
+      loop: "{{ classification_cases }}"
+      loop_control:
+        loop_var: classification_case
+
+    - name: Prove approved geometry does not overlap partition 3
+      ansible.builtin.assert:
+        that:
+          - 369100799 < 369100800
+          - 369100800 + 631114383 - 1 == 1000215182
+
+    - name: Prove overlap fixture is rejected
+      ansible.builtin.assert:
+        that:
+          - not (369100800 < 369100800)
+
+    - name: Prove serial mismatch expression is false
+      ansible.builtin.assert:
+        that:
+          - ('observed-serial' == 'expected-serial') == false
+
+    - name: Read inspection task order
+      ansible.builtin.set_fact:
+        inspection_tasks_text: "{{ lookup('file', '../roles/live_node_inspection/tasks/main.yml') }}"
+
+    - name: Prove report is declared before policy assertions
+      ansible.builtin.assert:
+        that:
+          - inspection_tasks_text.find('Print complete inspection report before policy assertions') >= 0
+          - inspection_tasks_text.find('Run policy assertions only after the report') > inspection_tasks_text.find('Print complete inspection report before policy assertions')
+
+    - name: Read build playbook
+      ansible.builtin.set_fact:
+        build_playbook_text: "{{ lookup('file', '../playbooks/00-build-archiso.yml') }}"
+
+    - name: Prove build does not import or invoke USB writing
+      ansible.builtin.assert:
+        that:
+          - "'archiso_usb_writer' not in build_playbook_text"
+          - "'write-archiso-usb' not in build_playbook_text"
+
+    - name: Read active ArchISO build tasks
+      ansible.builtin.set_fact:
+        build_tasks_text: "{{ lookup('file', '../roles/archiso_build/tasks/main.yml') }}"
+
+    - name: Prove publication moves the staged ISO out of temporary storage
+      ansible.builtin.assert:
+        that:
+          - "'Run mkarchiso directly so it can manage its own namespaces' in build_tasks_text"
+          - "'- -r' in build_tasks_text"
+          - "'async: 7200' in build_tasks_text"
+          - "'poll: 15' in build_tasks_text"
+          - "'ansible_facts' in build_tasks_text"
+          - "'date_time' in build_tasks_text"
+          - "'ansible_date_time' not in build_tasks_text"
+          - "'Move the staged ISO into the artifact directory' in build_tasks_text"
+          - "'- mv' in build_tasks_text"
+          - "'Restrict the published ISO permissions' in build_tasks_text"
+          - "'Refuse unsafe cleanup if a build mount remains' in build_tasks_text"
+          - "'Require the exact private build-root pattern before cleanup' in build_tasks_text"
+
+    - name: Read active USB-writer safety tasks
+      ansible.builtin.set_fact:
+        writer_tasks_text: "{{ lookup('file', '../roles/archiso_usb_writer/tasks/main.yml') }}"
+
+    - name: Prove legacy USB safety properties remain active
+      ansible.builtin.assert:
+        that:
+          - "'/run/archiso/bootmnt' in writer_tasks_text"
+          - "'conv=fsync' in writer_tasks_text"
+          - "'argv: [sync,' in writer_tasks_text"
+          - "'Require full read-back equality' in writer_tasks_text"
+
+    - name: Read active ArchISO wrapper
+      ansible.builtin.set_fact:
+        archiso_wrapper_text: "{{ lookup('file', '../archiso.sh') }}"
+
+    - name: Prove wrapper delegates instead of duplicating raw writes
+      ansible.builtin.assert:
+        that:
+          - "'playbooks/00-build-archiso.yml' in archiso_wrapper_text"
+          - "'playbooks/10-write-archiso-usb.yml' in archiso_wrapper_text"
+          - "'verify --iso IMAGE.iso' in archiso_wrapper_text"
+          - "'verify|--verify' in archiso_wrapper_text"
+          - "'verify_iso_checksum' in archiso_wrapper_text"
+          - "'checksum sidecar must contain exactly one record' in archiso_wrapper_text"
+          - "'checksum sidecar does not name the requested ISO' in archiso_wrapper_text"
+          - "'sha256sum --' in archiso_wrapper_text"
+          - "'source \"$SCRIPT_DIR/export.sh\"' in archiso_wrapper_text"
+          - "' dd ' not in archiso_wrapper_text"
+
+    - name: Create private ISO-verification fixture directory
+      ansible.builtin.tempfile:
+        state: directory
+        path: /tmp
+        prefix: kube-iso-verify-
+      register: iso_verify_temp
+
+    - name: Exercise valid and invalid ISO checksum sidecars
+      block:
+        - name: Write synthetic ISO fixture
+          ansible.builtin.copy:
+            dest: "{{ iso_verify_temp.path }}/fixture.iso"
+            content: synthetic ISO fixture
+            mode: '0600'
+
+        - name: Hash synthetic ISO fixture
+          ansible.builtin.stat:
+            path: "{{ iso_verify_temp.path }}/fixture.iso"
+            checksum_algorithm: sha256
+          register: iso_verify_checksum
+
+        - name: Write matching checksum sidecar
+          ansible.builtin.copy:
+            dest: "{{ iso_verify_temp.path }}/fixture.iso.sha256"
+            content: "{{ iso_verify_checksum.stat.checksum }}  fixture.iso\n"
+            mode: '0600'
+
+        - name: Require verify to accept matching content
+          ansible.builtin.command:
+            argv:
+              - "{{ playbook_dir }}/../archiso.sh"
+              - verify
+              - --iso
+              - "{{ iso_verify_temp.path }}/fixture.iso"
+          changed_when: false
+          register: valid_iso_verify
+
+        - name: Corrupt the synthetic ISO fixture
+          ansible.builtin.copy:
+            dest: "{{ iso_verify_temp.path }}/fixture.iso"
+            content: corrupted synthetic ISO fixture
+            mode: '0600'
+
+        - name: Require verify to reject mismatched content
+          ansible.builtin.command:
+            argv:
+              - "{{ playbook_dir }}/../archiso.sh"
+              - verify
+              - --iso
+              - "{{ iso_verify_temp.path }}/fixture.iso"
+          changed_when: false
+          failed_when: false
+          register: invalid_iso_verify
+
+        - name: Prove both checksum outcomes
+          ansible.builtin.assert:
+            that:
+              - valid_iso_verify.rc == 0
+              - "'Verified ISO:' in valid_iso_verify.stdout"
+              - invalid_iso_verify.rc != 0
+              - "'does not match its checksum sidecar' in invalid_iso_verify.stderr"
+      always:
+        - name: Remove private ISO-verification fixture directory
+          ansible.builtin.file:
+            path: "{{ iso_verify_temp.path }}"
+            state: absent
+
+    - name: Read active Ansible helper
+      ansible.builtin.set_fact:
+        ansible_helper_text: "{{ lookup('file', '../ansible.sh') }}"
+
+    - name: Prove common helper sources the environment and runs bounded commands
+      ansible.builtin.assert:
+        that:
+          - "'source \"$SCRIPT_DIR/export.sh\"' in ansible_helper_text"
+          - "'run_syntax' in ansible_helper_text"
+          - "'run_tests' in ansible_helper_text"
+          - "'Ansible syntax validation failed' in ansible_helper_text"
+          - "'Ansible fixture failed' in ansible_helper_text"
+          - "'Validation succeeded: every syntax check and fixture passed.' in ansible_helper_text"
+          - "'ansible-inventory --host' in ansible_helper_text"

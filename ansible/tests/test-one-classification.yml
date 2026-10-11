@@ -1,0 +1,15 @@
+---
+- name: Reset classification fixture inputs
+  ansible.builtin.set_fact:
+    inspection_p3_present: "{{ classification_case.present }}"
+    inspection_signature_types: "{{ classification_case.signatures }}"
+    inspection_ceph_recognized: "{{ classification_case.ceph }}"
+
+- name: Classify fixture
+  ansible.builtin.include_tasks: ../roles/live_node_inspection/tasks/classify.yml
+
+- name: Require expected fixture classification
+  ansible.builtin.assert:
+    that:
+      - partition3_classification == classification_case.expected
+    fail_msg: "Classification failed for {{ classification_case.name }}"

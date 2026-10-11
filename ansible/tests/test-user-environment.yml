@@ -1,0 +1,56 @@
+---
+- name: Render and non-destructively validate managed Bash
+  hosts: localhost
+  gather_facts: false
+  vars:
+    install_disk: /dev/nvme0n1
+  tasks:
+    - name: Create private template test directory
+      ansible.builtin.tempfile:
+        state: directory
+        path: /tmp
+        prefix: kube-bash-template-
+      register: bash_test_temp
+
+    - name: Validate rendered Bash without invoking ramget
+      block:
+        - name: Render Bash fixture
+          ansible.builtin.template:
+            src: ../roles/user_environment/templates/bashrc.j2
+            dest: "{{ bash_test_temp.path }}/bashrc"
+            mode: '0600'
+
+        - name: Parse rendered Bash
+          ansible.builtin.command:
+            argv: [bash, -n, "{{ bash_test_temp.path }}/bashrc"]
+          changed_when: false
+
+        - name: Load interactive configuration and locate ramget without calling it
+          ansible.builtin.command:
+            argv:
+              - bash
+              - --noprofile
+              - --norc
+              - -ic
+              - "source '{{ bash_test_temp.path }}/bashrc'; declare -F ramget"
+          environment:
+            TERM: linux
+          changed_when: false
+
+        - name: Read rendered Bash for forbidden zsh variable and accidental call
+          ansible.builtin.slurp:
+            src: "{{ bash_test_temp.path }}/bashrc"
+          register: rendered_bash
+
+        - name: Enforce Bash-specific history and safe zram definition
+          ansible.builtin.assert:
+            that:
+              - "'SAVEHIST' not in (rendered_bash.content | b64decode)"
+              - "'-D nvme0n1' in (rendered_bash.content | b64decode)"
+              - "(rendered_bash.content | b64decode).count('ramget()') == 1"
+              - "'ramget\n' not in (rendered_bash.content | b64decode)"
+      always:
+        - name: Remove template test directory
+          ansible.builtin.file:
+            path: "{{ bash_test_temp.path }}"
+            state: absent
