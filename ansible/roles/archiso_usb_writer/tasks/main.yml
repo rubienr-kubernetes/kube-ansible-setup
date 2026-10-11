@@ -1,0 +1,198 @@
+---
+- name: Require explicit writer inputs
+  ansible.builtin.assert:
+    that:
+      - iso_path | default('') | length > 0
+      - iso_sha256 | default('') is match('^[0-9a-f]{64}$')
+      - usb_device | default('') is match('^/dev/disk/by-id/usb-')
+      - usb_device is not search('-part[0-9]+$')
+    fail_msg: Supply explicit iso_path, iso_sha256, and a stable whole-device /dev/disk/by-id/usb-* target.
+
+- name: Inspect running kernel command line for ArchISO markers
+  ansible.builtin.command:
+    argv: [cat, /proc/cmdline]
+  register: writer_kernel_cmdline
+  changed_when: false
+
+- name: Inspect copy-to-RAM ArchISO runtime markers
+  ansible.builtin.stat:
+    path: "{{ item }}"
+  loop:
+    - /run/archiso/airootfs
+    - /run/archiso/copytoram
+    - /run/archiso/cowspace
+  register: writer_archiso_runtime_markers
+
+- name: Refuse USB writing from an ArchISO live environment
+  ansible.builtin.assert:
+    that:
+      - "'archisobasedir=' not in writer_kernel_cmdline.stdout"
+      - "'archisosearchuuid=' not in writer_kernel_cmdline.stdout"
+      - writer_archiso_runtime_markers.results | selectattr('stat.exists') | list | length == 0
+    fail_msg: USB writing is forbidden from an ArchISO live environment.
+
+- name: Inspect ISO
+  ansible.builtin.stat:
+    path: "{{ iso_path }}"
+    checksum_algorithm: sha256
+  register: writer_iso
+
+- name: Verify ISO and caller-supplied checksum
+  ansible.builtin.assert:
+    that:
+      - writer_iso.stat.isreg | default(false)
+      - writer_iso.stat.checksum == iso_sha256
+
+- name: Resolve stable USB path
+  ansible.builtin.command:
+    argv: [readlink, -e, "{{ usb_device }}"]
+  register: writer_resolved
+  changed_when: false
+
+- name: Inspect resolved whole device
+  ansible.builtin.command:
+    argv: [lsblk, --bytes, --nodeps, --noheadings, --output, 'TYPE,TRAN,RM,SIZE,MODEL,SERIAL', "{{ writer_resolved.stdout }}"]
+  register: writer_identity
+  changed_when: false
+
+- name: Parse target identity
+  ansible.builtin.set_fact:
+    writer_fields: "{{ writer_identity.stdout.split() }}"
+
+- name: Inspect target and descendant mounts
+  ansible.builtin.command:
+    argv: [lsblk, --noheadings, --raw, --paths, --output, MOUNTPOINTS, "{{ writer_resolved.stdout }}"]
+  register: writer_mounts
+  changed_when: false
+
+- name: Inspect running root source
+  ansible.builtin.command:
+    argv: [findmnt, --noheadings, --raw, --output, SOURCE, /]
+  register: writer_root_source
+  changed_when: false
+
+- name: Inspect block stack containing root
+  ansible.builtin.command:
+    argv: [lsblk, --inverse, --noheadings, --raw, --paths, --output, NAME, "{{ writer_root_source.stdout }}"]
+  register: writer_root_stack
+  changed_when: false
+  failed_when: false
+
+- name: Inspect live-ISO boot source
+  ansible.builtin.command:
+    argv: [findmnt, --noheadings, --raw, --output, SOURCE, /run/archiso/bootmnt]
+  register: writer_live_source
+  changed_when: false
+  failed_when: false
+
+- name: Inspect block stack containing live-ISO boot source
+  ansible.builtin.command:
+    argv: [lsblk, --inverse, --noheadings, --raw, --paths, --output, NAME, "{{ writer_live_source.stdout }}"]
+  register: writer_live_stack
+  changed_when: false
+  failed_when: false
+  when: writer_live_source.rc == 0
+
+- name: Enforce whole-USB target safety policy
+  ansible.builtin.assert:
+    that:
+      - writer_fields | length >= 4
+      - writer_fields[0] == 'disk'
+      - writer_fields[1] == 'usb'
+      - writer_fields[2] in ['0', '1']
+      - writer_fields[2] == '1' or (allow_fixed_usb | default(false) | bool)
+      - writer_fields[3] | int >= writer_iso.stat.size | int
+      - writer_mounts.stdout_lines | map('trim') | reject('equalto', '') | list | length == 0
+      - writer_resolved.stdout not in writer_root_stack.stdout_lines
+      - writer_live_source.rc != 0 or writer_resolved.stdout not in writer_live_stack.stdout_lines
+    fail_msg: The target failed transport, removability, capacity, mount, running-root, or live-ArchISO validation.
+
+- name: Display resolved destructive target
+  ansible.builtin.debug:
+    msg:
+      iso: "{{ iso_path }}"
+      iso_bytes: "{{ writer_iso.stat.size }}"
+      iso_sha256: "{{ writer_iso.stat.checksum }}"
+      stable_target: "{{ usb_device }}"
+      resolved_target: "{{ writer_resolved.stdout }}"
+      identity: "{{ writer_identity.stdout | trim }}"
+      read_back: "{{ usb_full_readback | default(true) | bool }}"
+
+- name: Require exact interactive confirmation
+  ansible.builtin.pause:
+    prompt: >-
+      Type exactly "WRITE {{ 'FIXED USB ' if writer_fields[2] == '0' else '' }}{{ usb_device | basename }}
+      SHA256 {{ writer_iso.stat.checksum }}" to destroy the displayed USB target
+  register: writer_confirmation
+
+- name: Validate exact confirmation
+  ansible.builtin.assert:
+    that:
+      - >-
+        writer_confirmation.user_input ==
+        ('WRITE ' ~ ('FIXED USB ' if writer_fields[2] == '0' else '') ~
+         (usb_device | basename) ~ ' SHA256 ' ~ writer_iso.stat.checksum)
+    fail_msg: Confirmation did not match; nothing was written.
+
+- name: Create private read-back directory
+  ansible.builtin.tempfile:
+    state: directory
+    path: /tmp
+    prefix: kube-usb-readback-
+  register: writer_temp
+  when: usb_full_readback | default(true) | bool
+
+- name: Write and verify USB
+  block:
+    - name: Write ISO with final fsync
+      ansible.builtin.command:
+        argv:
+          - dd
+          - "if={{ iso_path }}"
+          - "of={{ writer_resolved.stdout }}"
+          - bs=4M
+          - status=progress
+          - conv=fsync
+      become: true
+      changed_when: true
+
+    - name: Flush the target device after writing
+      ansible.builtin.command:
+        argv: [sync, "{{ writer_resolved.stdout }}"]
+      become: true
+      changed_when: false
+
+    - name: Read back exactly the ISO byte count
+      ansible.builtin.command:
+        argv:
+          - dd
+          - "if={{ writer_resolved.stdout }}"
+          - "of={{ writer_temp.path }}/readback.iso"
+          - bs=4M
+          - iflag=count_bytes
+          - "count={{ writer_iso.stat.size }}"
+          - status=progress
+      become: true
+      changed_when: false
+      when: usb_full_readback | default(true) | bool
+
+    - name: Hash complete read-back
+      ansible.builtin.stat:
+        path: "{{ writer_temp.path }}/readback.iso"
+        checksum_algorithm: sha256
+      become: true
+      register: writer_readback
+      when: usb_full_readback | default(true) | bool
+
+    - name: Require full read-back equality
+      ansible.builtin.assert:
+        that:
+          - writer_readback.stat.size == writer_iso.stat.size
+          - writer_readback.stat.checksum == writer_iso.stat.checksum
+      when: usb_full_readback | default(true) | bool
+  always:
+    - name: Remove private read-back data
+      ansible.builtin.file:
+        path: "{{ writer_temp.path }}"
+        state: absent
+      when: writer_temp is not skipped

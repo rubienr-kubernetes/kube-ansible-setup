@@ -1,0 +1,6 @@
+---
+- name: Validate and write one explicit ArchISO to one explicit USB device
+  hosts: localhost
+  gather_facts: false
+  roles:
+    - role: archiso_usb_writer

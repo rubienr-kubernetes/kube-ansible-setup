@@ -1,0 +1,305 @@
+---
+- name: Validate build inputs
+  ansible.builtin.assert:
+    that:
+      - ansible_facts.system == 'Linux'
+      - archiso_live_hostname is match('^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$')
+      - archiso_releng_profile is directory
+      - archiso_overlay_dir is directory
+      - installer_public_key_file is file
+      - boot_next_installer_file is file
+    fail_msg: ArchISO build inputs are incomplete on this controller.
+
+- name: Find installed upstream releng inputs
+  ansible.builtin.find:
+    paths: "{{ archiso_releng_profile }}"
+    recurse: true
+    file_type: file
+  register: releng_files
+
+- name: Hash installed upstream releng inputs
+  ansible.builtin.stat:
+    path: "{{ item.path }}"
+    checksum_algorithm: sha256
+  loop: "{{ releng_files.files }}"
+  register: releng_checksums
+
+- name: Hash the BootNext helper input
+  ansible.builtin.stat:
+    path: "{{ boot_next_installer_file }}"
+    checksum_algorithm: sha256
+  register: boot_next_installer_checksum
+
+- name: Verify user namespaces required by rootless mkarchiso
+  ansible.builtin.command:
+    argv: [unshare, --map-auto, --map-root-user, 'true']
+  changed_when: false
+
+- name: Create private build root
+  ansible.builtin.tempfile:
+    state: directory
+    path: /tmp
+    prefix: kube-archiso-
+  register: archiso_temp
+
+- name: Build and attest the generic live ISO
+  block:
+    - name: Set private build paths
+      ansible.builtin.set_fact:
+        archiso_profile_dir: "{{ archiso_temp.path }}/releng"
+        archiso_work_dir: "{{ archiso_temp.path }}/work"
+        archiso_stage_dir: "{{ archiso_temp.path }}/out"
+
+    - name: Create private work and stage directories
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        mode: '0700'
+      loop:
+        - "{{ archiso_work_dir }}"
+        - "{{ archiso_stage_dir }}"
+
+    - name: Copy the installed upstream releng profile
+      ansible.builtin.command:
+        argv:
+          - cp
+          - --archive
+          - "{{ archiso_releng_profile }}"
+          - "{{ archiso_profile_dir }}"
+      changed_when: true
+
+    - name: Apply tracked airootfs overlay
+      ansible.builtin.copy:
+        src: "{{ archiso_overlay_dir }}/airootfs/"
+        dest: "{{ archiso_profile_dir }}/airootfs/"
+        mode: preserve
+
+    - name: Add live-environment packages declaratively
+      ansible.builtin.lineinfile:
+        path: "{{ archiso_profile_dir }}/packages.x86_64"
+        line: "{{ item }}"
+        state: present
+      loop: "{{ archiso_packages }}"
+
+    - name: Render the generic live hostname
+      ansible.builtin.template:
+        src: hostname.j2
+        dest: "{{ archiso_profile_dir }}/airootfs/etc/hostname"
+        mode: '0644'
+
+    - name: Create live root SSH directory
+      ansible.builtin.file:
+        path: "{{ archiso_profile_dir }}/airootfs/root/.ssh"
+        state: directory
+        mode: '0700'
+
+    - name: Install the approved public key in the image
+      ansible.builtin.copy:
+        src: "{{ installer_public_key_file }}"
+        dest: "{{ archiso_profile_dir }}/airootfs/root/.ssh/authorized_keys"
+        mode: '0600'
+
+    - name: Install the BootNext helper in the live root home
+      ansible.builtin.copy:
+        src: "{{ boot_next_installer_file }}"
+        dest: "{{ archiso_profile_dir }}/airootfs/root/boot-next-installer.sh"
+        mode: '0755'
+
+    - name: Declare non-default airootfs permissions in profiledef
+      ansible.builtin.lineinfile:
+        path: "{{ archiso_profile_dir }}/profiledef.sh"
+        insertafter: '^file_permissions=\($'
+        line: "  [\"{{ item.path }}\"]=\"0:0:{{ item.mode }}\""
+      loop:
+        - {path: /root/.ssh, mode: '700'}
+        - {path: /root/.ssh/authorized_keys, mode: '600'}
+        - {path: /root/boot-next-installer.sh, mode: '755'}
+
+    - name: Create live service enablement directory
+      ansible.builtin.file:
+        path: "{{ archiso_profile_dir }}/airootfs/etc/systemd/system/multi-user.target.wants"
+        state: directory
+        mode: '0755'
+
+    - name: Enable required live services
+      ansible.builtin.file:
+        src: "/usr/lib/systemd/system/{{ item }}"
+        dest: "{{ archiso_profile_dir }}/airootfs/etc/systemd/system/multi-user.target.wants/{{ item }}"
+        state: link
+        force: true
+      loop:
+        - avahi-daemon.service
+        - sshd.service
+        - systemd-networkd.service
+        - systemd-resolved.service
+
+    - name: Use systemd-resolved stub resolver in the live image
+      ansible.builtin.file:
+        src: /run/systemd/resolve/stub-resolv.conf
+        dest: "{{ archiso_profile_dir }}/airootfs/etc/resolv.conf"
+        state: link
+        force: true
+
+    - name: Disable IPv6 in every live-image boot path
+      ansible.builtin.replace:
+        path: "{{ archiso_profile_dir }}/{{ item }}"
+        regexp: ' %KERNEL_PARAMS%'
+        replace: ' ipv6.disable=1 %KERNEL_PARAMS%'
+      loop:
+        - efiboot/loader/entries/01-archiso-linux.conf
+        - efiboot/loader/entries/02-archiso-speech-linux.conf
+        - grub/grub.cfg
+        - grub/loopback.cfg
+        - syslinux/archiso_sys-linux.cfg
+        - syslinux/archiso_pxe-linux.cfg
+
+    - name: Create artifact output directory
+      ansible.builtin.file:
+        path: "{{ archiso_output_dir }}"
+        state: directory
+        mode: '0700'
+
+    - name: Run mkarchiso directly so it can manage its own namespaces
+      ansible.builtin.command:
+        argv:
+          - mkarchiso
+          - -v
+          - -r
+          - -w
+          - "{{ archiso_work_dir }}"
+          - -o
+          - "{{ archiso_stage_dir }}"
+          - "{{ archiso_profile_dir }}"
+      async: 7200
+      poll: 15
+      changed_when: true
+
+    - name: Locate the single built ISO
+      ansible.builtin.find:
+        paths: "{{ archiso_stage_dir }}"
+        patterns: '*.iso'
+        file_type: file
+      register: built_isos
+
+    - name: Require exactly one ISO output
+      ansible.builtin.assert:
+        that:
+          - built_isos.matched == 1
+
+    - name: Set generic final artifact path
+      ansible.builtin.set_fact:
+        archiso_final_path: "{{ archiso_output_dir }}/archlinux-{{ ansible_facts['date_time']['date'] }}-{{ archiso_live_hostname }}.iso"
+
+    - name: Move the staged ISO into the artifact directory
+      ansible.builtin.command:
+        argv:
+          - mv
+          - '--'
+          - "{{ built_isos.files[0].path }}"
+          - "{{ archiso_final_path }}"
+      changed_when: true
+
+    - name: Restrict the published ISO permissions
+      ansible.builtin.file:
+        path: "{{ archiso_final_path }}"
+        state: file
+        mode: '0600'
+
+    - name: Calculate ISO SHA-256
+      ansible.builtin.stat:
+        path: "{{ archiso_final_path }}"
+        checksum_algorithm: sha256
+      register: archiso_iso_checksum
+
+    - name: Write checksum sidecar
+      ansible.builtin.copy:
+        dest: "{{ archiso_final_path }}.sha256"
+        content: "{{ archiso_iso_checksum.stat.checksum }}  {{ archiso_final_path | basename }}\n"
+        mode: '0600'
+
+    - name: Read build-tool versions
+      ansible.builtin.command:
+        argv: [pacman, -Q, "{{ item }}"]
+      loop:
+        - archiso
+        - ansible-core
+      register: build_versions
+      changed_when: false
+
+    - name: Assign build-tool version records
+      ansible.builtin.set_fact:
+        archiso_version: "{{ build_versions.results[0] }}"
+        ansible_core_version: "{{ build_versions.results[1] }}"
+
+    - name: Record exact live package versions from the sync database
+      ansible.builtin.command:
+        argv: [pacman, -Sp, --print-format, '%n %v', "{{ item }}"]
+      loop: "{{ archiso_packages }}"
+      register: archiso_live_package_versions
+      changed_when: false
+
+    - name: Hash the rendered package list
+      ansible.builtin.stat:
+        path: "{{ archiso_profile_dir }}/packages.x86_64"
+        checksum_algorithm: sha256
+      register: archiso_packages_checksum
+
+    - name: Find tracked overlay files
+      ansible.builtin.find:
+        paths: "{{ archiso_overlay_dir }}"
+        recurse: true
+        file_type: file
+      register: overlay_files
+
+    - name: Hash tracked overlay files
+      ansible.builtin.stat:
+        path: "{{ item.path }}"
+        checksum_algorithm: sha256
+      loop: "{{ overlay_files.files }}"
+      register: overlay_checksums
+
+    - name: Write build manifest
+      ansible.builtin.template:
+        src: build-manifest.txt.j2
+        dest: "{{ archiso_final_path }}.manifest.txt"
+        mode: '0600'
+
+    - name: Display published ArchISO artifacts
+      ansible.builtin.debug:
+        msg:
+          iso: "{{ archiso_final_path }}"
+          checksum: "{{ archiso_final_path }}.sha256"
+          manifest: "{{ archiso_final_path }}.manifest.txt"
+  always:
+    - name: Inspect mounts below the private build root
+      ansible.builtin.command:
+        argv: [findmnt, --raw, --noheadings, --output, TARGET]
+      register: build_mounts
+      changed_when: false
+      failed_when: false
+
+    - name: Refuse unsafe cleanup if a build mount remains
+      ansible.builtin.assert:
+        that:
+          - >-
+            build_mounts.stdout_lines |
+            select('match', '^' ~ (archiso_temp.path | regex_escape) ~ '(/|$)') |
+            list | length == 0
+        fail_msg: A mount remains below the private ArchISO build root; inspect it manually.
+
+    - name: Require the exact private build-root pattern before cleanup
+      ansible.builtin.assert:
+        that:
+          - archiso_temp.path is match('^/tmp/kube-archiso-[^/]+$')
+
+    - name: Remove the unmounted private build tree through a user namespace
+      ansible.builtin.command:
+        argv:
+          - unshare
+          - --map-auto
+          - --map-root-user
+          - rm
+          - -rf
+          - '--'
+          - "{{ archiso_temp.path }}"
+      changed_when: true

@@ -1,0 +1,21 @@
+artifact={{ archiso_final_path | basename }}
+scope=generic-live-installer
+hostname={{ archiso_live_hostname }}
+iso_sha256={{ archiso_iso_checksum.stat.checksum }}
+archiso_package={{ archiso_version.stdout }}
+ansible_core_package={{ ansible_core_version.stdout }}
+releng_profile={{ archiso_releng_profile }}
+packages_sha256={{ archiso_packages_checksum.stat.checksum }}
+boot_next_installer_sha256={{ boot_next_installer_checksum.stat.checksum }}
+live_package_versions:
+{% for item in archiso_live_package_versions.results %}
+  {{ item.stdout | trim }}
+{% endfor %}
+upstream_releng_files:
+{% for item in releng_checksums.results | sort(attribute='item.path') %}
+  {{ item.stat.checksum }}  {{ item.item.path | relpath(archiso_releng_profile) }}
+{% endfor %}
+overlay_files:
+{% for item in overlay_checksums.results | sort(attribute='item.path') %}
+  {{ item.stat.checksum }}  {{ item.item.path | relpath(archiso_overlay_dir) }}
+{% endfor %}
