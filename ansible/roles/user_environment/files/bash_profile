@@ -1,0 +1,4 @@
+# Managed by Ansible.
+if [[ -r $HOME/.bashrc ]]; then
+    source "$HOME/.bashrc"
+fi

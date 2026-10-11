@@ -23,6 +23,15 @@
     mode: '0644'
   loop: "{{ managed_bash_users }}"
 
+- name: Install managed Bash login profile
+  ansible.builtin.copy:
+    src: bash_profile
+    dest: "{{ item.home }}/.bash_profile"
+    owner: "{{ item.name }}"
+    group: "{{ item.name }}"
+    mode: '0644'
+  loop: "{{ managed_bash_users }}"
+
 - name: Install managed Git configuration without inventing identity
   ansible.builtin.template:
     src: gitconfig.j2

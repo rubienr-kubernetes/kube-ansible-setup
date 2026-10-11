@@ -17,29 +17,38 @@
         - name: Render Bash fixture
           ansible.builtin.template:
             src: ../roles/user_environment/templates/bashrc.j2
-            dest: "{{ bash_test_temp.path }}/bashrc"
+            dest: "{{ bash_test_temp.path }}/.bashrc"
             mode: '0600'
 
-        - name: Parse rendered Bash
+        - name: Install static Bash login-profile fixture
+          ansible.builtin.copy:
+            src: ../roles/user_environment/files/bash_profile
+            dest: "{{ bash_test_temp.path }}/.bash_profile"
+            mode: '0600'
+
+        - name: Parse managed Bash files
           ansible.builtin.command:
-            argv: [bash, -n, "{{ bash_test_temp.path }}/bashrc"]
+            argv: [bash, -n, "{{ bash_test_temp.path }}/{{ item }}"]
+          loop:
+            - .bashrc
+            - .bash_profile
           changed_when: false
 
-        - name: Load interactive configuration and locate ramget without calling it
+        - name: Start login Bash and locate ramget without calling it
           ansible.builtin.command:
             argv:
               - bash
-              - --noprofile
-              - --norc
+              - --login
               - -ic
-              - "source '{{ bash_test_temp.path }}/bashrc'; declare -F ramget"
+              - declare -F ramget
           environment:
+            HOME: "{{ bash_test_temp.path }}"
             TERM: linux
           changed_when: false
 
         - name: Read rendered Bash for forbidden zsh variable and accidental call
           ansible.builtin.slurp:
-            src: "{{ bash_test_temp.path }}/bashrc"
+            src: "{{ bash_test_temp.path }}/.bashrc"
           register: rendered_bash
 
         - name: Enforce Bash-specific history and safe zram definition

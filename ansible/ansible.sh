@@ -71,6 +71,7 @@ run_syntax() {
 
     bash -n ansible.sh archiso.sh boot-next-installer.sh export.sh \
         roles/host_baseline/files/manage-root-ssh-access.sh \
+        roles/user_environment/files/bash_profile \
         tests/test-boot-installer-next.sh || \
         die "shell-helper syntax validation failed"
     for playbook in \
