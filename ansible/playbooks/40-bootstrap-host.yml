@@ -1,0 +1,163 @@
+---
+- name: Establish permanent administration and host baseline
+  hosts: "{{ target_node | default('none') }}"
+  gather_facts: true
+  remote_user: root
+  become: false
+  vars_prompt:
+    - name: admin_password
+      prompt: Password for the permanent kube administrator (never stored)
+      private: true
+      confirm: true
+  pre_tasks:
+    - name: Require explicit host-bootstrap authorization
+      ansible.builtin.assert:
+        that:
+          - bootstrap_node_execute | default(false) | bool
+        fail_msg: >-
+          Host bootstrap changes packages, creates the permanent administrator,
+          and installs the manual root-SSH maintenance gate. Use the guarded
+          ansible.sh command.
+
+    - name: Require the controller SSH trust file
+      ansible.builtin.assert:
+        that:
+          - bootstrap_known_hosts_file | default('') is match('^/tmp/kube-node-bootstrap-known-hosts\\.[A-Za-z0-9]+$')
+        fail_msg: The guarded bootstrap requires its private controller known-hosts file.
+
+    - name: Require a non-empty in-memory administrator password
+      ansible.builtin.assert:
+        that:
+          - admin_password | length >= 12
+      no_log: true
+
+    - name: Create permanent administrator with a one-way password hash
+      ansible.builtin.user:
+        name: "{{ admin_user }}"
+        shell: /bin/bash
+        create_home: true
+        groups: wheel
+        append: true
+        password: "{{ admin_password | password_hash('sha512') }}"
+        update_password: on_create
+      no_log: true
+
+    - name: Install permanent administrator public key
+      ansible.posix.authorized_key:
+        user: "{{ admin_user }}"
+        key: "{{ lookup('file', installer_public_key_file) }}"
+        state: present
+
+    - name: Install password-requiring sudo policy
+      ansible.builtin.template:
+        src: "{{ playbook_dir }}/../roles/host_baseline/templates/sudoers-kube.j2"
+        dest: "/etc/sudoers.d/50-{{ admin_user }}"
+        mode: '0440'
+        validate: /usr/sbin/visudo -cf %s
+
+  roles:
+    - role: host_baseline
+
+  post_tasks:
+    - name: Verify permanent key-only SSH from the controller
+      ansible.builtin.command:
+        argv:
+          - ssh
+          - -o
+          - BatchMode=yes
+          - -o
+          - PasswordAuthentication=no
+          - -F
+          - /dev/null
+          - -o
+          - "UserKnownHostsFile={{ bootstrap_known_hosts_file }}"
+          - -o
+          - StrictHostKeyChecking=yes
+          - "{{ admin_user }}@{{ ansible_host }}"
+          - /usr/bin/true
+      delegate_to: localhost
+      changed_when: false
+
+    - name: Install permanent key-only SSH policy
+      ansible.builtin.template:
+        src: "{{ playbook_dir }}/../roles/host_baseline/templates/10-kube-hardening.conf.j2"
+        dest: /etc/ssh/sshd_config.d/10-kube-hardening.conf
+        mode: '0644'
+        validate: /usr/sbin/sshd -t -f %s
+      notify: Restart sshd
+
+    - name: Install the manual root-SSH public-key access state
+      ansible.builtin.template:
+        src: "{{ playbook_dir }}/../roles/host_baseline/templates/05-root-maintenance.conf.j2"
+        dest: /etc/ssh/sshd_config.d/05-root-maintenance.conf
+        owner: root
+        group: root
+        mode: '0644'
+        validate: /usr/sbin/sshd -t -f %s
+      notify: Restart sshd
+
+    - name: Install the manual root-SSH access manager
+      ansible.builtin.template:
+        src: "{{ playbook_dir }}/../roles/host_baseline/templates/manage-root-ssh-access.sh.j2"
+        dest: /root/manage-root-ssh-access
+        owner: root
+        group: root
+        mode: '0700'
+
+    - name: Remove the temporary live-image root policy after replacement
+      ansible.builtin.file:
+        path: /etc/ssh/sshd_config.d/00-kube-live.conf
+        state: absent
+      notify: Restart sshd
+
+    - name: Lock root password
+      ansible.builtin.user:
+        name: root
+        password_lock: true
+
+    - name: Apply the verified SSH policies
+      ansible.builtin.meta: flush_handlers
+
+    - name: Verify permanent administrator SSH after policy replacement
+      ansible.builtin.command:
+        argv:
+          - ssh
+          - -F
+          - /dev/null
+          - -o
+          - BatchMode=yes
+          - -o
+          - PasswordAuthentication=no
+          - -o
+          - "UserKnownHostsFile={{ bootstrap_known_hosts_file }}"
+          - -o
+          - StrictHostKeyChecking=yes
+          - "{{ admin_user }}@{{ ansible_host }}"
+          - /usr/bin/true
+      delegate_to: localhost
+      changed_when: false
+
+    - name: Verify root public-key SSH remains enabled for manual maintenance
+      ansible.builtin.command:
+        argv:
+          - ssh
+          - -F
+          - /dev/null
+          - -o
+          - BatchMode=yes
+          - -o
+          - PasswordAuthentication=no
+          - -o
+          - "UserKnownHostsFile={{ bootstrap_known_hosts_file }}"
+          - -o
+          - StrictHostKeyChecking=yes
+          - root@{{ ansible_host }}
+          - /usr/bin/true
+      delegate_to: localhost
+      changed_when: false
+
+  handlers:
+    - name: Restart sshd
+      ansible.builtin.systemd_service:
+        name: sshd.service
+        state: restarted

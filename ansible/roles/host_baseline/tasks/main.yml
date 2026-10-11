@@ -1,0 +1,48 @@
+---
+- name: Validate every baseline package against current official repositories
+  ansible.builtin.command:
+    argv: [pacman, -Si, "{{ item }}"]
+  loop: "{{ host_baseline_packages }}"
+  register: baseline_package_queries
+  changed_when: false
+  failed_when: false
+
+- name: Fail closed instead of substituting AUR or guessed packages
+  ansible.builtin.assert:
+    that:
+      - item.rc == 0
+    fail_msg: >-
+      Required baseline package {{ item.item }} is not in the current official
+      repositories. Resolve the requirement explicitly; do not substitute AUR
+      or install an untracked script.
+  loop: "{{ baseline_package_queries.results }}"
+
+- name: Upgrade the Arch system as one transaction and install baseline packages
+  ansible.builtin.command:
+    argv: >-
+      {{ ['pacman', '--sync', '--refresh', '--sysupgrade', '--needed',
+          '--noconfirm'] + host_baseline_packages }}
+  environment:
+    LC_ALL: C
+  register: baseline_package_transaction
+  changed_when: "'there is nothing to do' not in baseline_package_transaction.stdout"
+
+- name: Remove packages excluded from the approved host baseline
+  community.general.pacman:
+    name:
+      - podman
+      - podman-compose
+      - zsh
+      - zsh-autocomplete
+      - zsh-autosuggestions
+      - zsh-completions
+      - zsh-syntax-highlighting
+    state: absent
+
+- name: Reconcile the root-owned BootNext maintenance helper
+  ansible.builtin.copy:
+    src: "{{ boot_next_installer_file }}"
+    dest: /root/boot-next-installer.sh
+    owner: root
+    group: root
+    mode: '0755'

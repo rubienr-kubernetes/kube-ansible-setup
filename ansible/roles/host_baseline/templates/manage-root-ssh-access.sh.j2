@@ -1,0 +1,111 @@
+#!/usr/bin/env bash
+
+set -Eeuo pipefail
+
+readonly PROGRAM=${0##*/}
+readonly SSHD_CONFIG=/etc/ssh/sshd_config.d/05-root-maintenance.conf
+
+die() {
+    printf '%s: error: %s\n' "$PROGRAM" "$*" >&2
+    exit 1
+}
+
+usage() {
+    printf 'Usage: %s {enable|disable|status}\n' "$PROGRAM"
+}
+
+effective_setting() {
+    /usr/bin/sshd -T \
+        -C "user=root,host=$(/usr/bin/hostname),addr=127.0.0.1" |
+        /usr/bin/awk '$1 == "permitrootlogin" { print $2; exit }'
+}
+
+show_status() {
+    local value
+    value=$(effective_setting)
+    case $value in
+        prohibit-password|without-password)
+            printf 'Root SSH public-key access: enabled (%s)\n' "$value"
+            ;;
+        no)
+            printf 'Root SSH public-key access: disabled\n'
+            ;;
+        *)
+            die "unexpected effective PermitRootLogin value: $value"
+            ;;
+    esac
+}
+
+apply_state() {
+    local action=$1 desired expected temporary backup observed
+
+    case $action in
+        enable)
+            desired=prohibit-password
+            expected=enabled
+            ;;
+        disable)
+            desired=no
+            expected=disabled
+            ;;
+        *)
+            die "internal unsupported state: $action"
+            ;;
+    esac
+
+    [[ -f $SSHD_CONFIG ]] || die "managed configuration is missing: $SSHD_CONFIG"
+    temporary=$(/usr/bin/mktemp "${SSHD_CONFIG}.new.XXXXXX")
+    backup=$(/usr/bin/mktemp "${SSHD_CONFIG}.old.XXXXXX")
+    trap '/usr/bin/rm -f -- "$temporary" "$backup"' EXIT
+
+    /usr/bin/cp --preserve=mode,ownership -- "$SSHD_CONFIG" "$backup"
+    /usr/bin/printf '%s\n' \
+        '# Managed by /root/manage-root-ssh-access.' \
+        '# Root passwords remain disabled; this controls public-key login only.' \
+        "PermitRootLogin $desired" >"$temporary"
+    /usr/bin/install -o root -g root -m 0644 -- "$temporary" "$SSHD_CONFIG"
+
+    if ! /usr/bin/sshd -t; then
+        /usr/bin/install -o root -g root -m 0644 -- "$backup" "$SSHD_CONFIG"
+        die 'sshd rejected the requested configuration; the previous state was restored'
+    fi
+    if ! /usr/bin/systemctl reload sshd.service; then
+        /usr/bin/install -o root -g root -m 0644 -- "$backup" "$SSHD_CONFIG"
+        /usr/bin/systemctl reload sshd.service || true
+        die 'sshd reload failed; the previous state was restored'
+    fi
+
+    observed=$(effective_setting)
+    if [[ $expected == enabled && $observed != prohibit-password && $observed != without-password ]] ||
+       [[ $expected == disabled && $observed != no ]]; then
+        /usr/bin/install -o root -g root -m 0644 -- "$backup" "$SSHD_CONFIG"
+        /usr/bin/systemctl reload sshd.service || true
+        die "effective PermitRootLogin is $observed; the previous state was restored"
+    fi
+
+    /usr/bin/logger -t manage-root-ssh-access \
+        "root SSH public-key access $expected by ${SUDO_USER:-root}"
+    show_status
+}
+
+(( EUID == 0 )) || die 'run through sudo or as root'
+(($# == 1)) || {
+    usage >&2
+    exit 2
+}
+
+case $1 in
+    enable|disable)
+        apply_state "$1"
+        ;;
+    status)
+        show_status
+        ;;
+    -h|--help)
+        usage
+        ;;
+    *)
+        usage >&2
+        die "unknown operation: $1"
+        ;;
+esac
