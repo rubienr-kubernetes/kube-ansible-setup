@@ -1,0 +1,75 @@
+---
+- name: Read installed-node target disk
+  ansible.builtin.command:
+    argv: [lsblk, --bytes, --json, --output, PATH,TYPE,SIZE,LOG-SEC,PHY-SEC,MODEL,SERIAL, "{{ install_disk }}"]
+  register: osd_lsblk
+  changed_when: false
+
+- name: Read installed-node GPT
+  ansible.builtin.command:
+    argv: [sfdisk, --json, "{{ install_disk }}"]
+  register: osd_sfdisk
+  changed_when: false
+
+- name: Parse installed-node disk and partition 3
+  ansible.builtin.set_fact:
+    osd_disk: "{{ (osd_lsblk.stdout | from_json).blockdevices | first }}"
+    osd_table: "{{ (osd_sfdisk.stdout | from_json).partitiontable }}"
+    osd_partition3: >-
+      {{ (osd_sfdisk.stdout | from_json).partitiontable.partitions |
+         selectattr('node', 'equalto', install_disk ~ 'p3') |
+         list | first | default({}) }}
+
+- name: Record installed-node partition 3 presence
+  ansible.builtin.set_fact:
+    inspection_p3_present: "{{ osd_partition3 | length > 0 }}"
+
+- name: Read partition 3 signatures
+  ansible.builtin.command:
+    argv: [wipefs, --no-act, --json, "{{ install_disk }}p3"]
+  register: osd_wipefs
+  changed_when: false
+  failed_when: false
+  when: inspection_p3_present
+
+- name: Read partition 3 LVM tags
+  ansible.builtin.command:
+    argv: [pvs, --reportformat, json, --options, pv_name,pv_uuid,vg_name,pv_tags, "{{ install_disk }}p3"]
+  register: osd_pvs
+  changed_when: false
+  failed_when: false
+  when: inspection_p3_present
+
+- name: Derive installed-node signature evidence
+  ansible.builtin.set_fact:
+    inspection_signature_types: >-
+      {{ (osd_wipefs.stdout | default('')) |
+         regex_findall('"type"\\s*:\\s*"([^"]+)"') | unique | list }}
+    inspection_ceph_recognized: >-
+      {{ 'ceph_bluestore' in (osd_wipefs.stdout | default('') | lower)
+         or 'ceph' in (osd_pvs.stdout | default('') | lower) }}
+
+- name: Classify installed-node partition 3
+  ansible.builtin.include_tasks: ../../live_node_inspection/tasks/classify.yml
+
+- name: Print installed-node storage report before assertions
+  ansible.builtin.debug:
+    msg:
+      disk: "{{ osd_disk }}"
+      partitions: "{{ osd_table.partitions }}"
+      partition3: "{{ osd_partition3 }}"
+      signature_types: "{{ inspection_signature_types }}"
+      ceph_identity: "{{ osd_pvs.stdout | default('unavailable', true) }}"
+      classification: "{{ partition3_classification }}"
+
+- name: Enforce installed-node disk identity after reporting
+  ansible.builtin.assert:
+    that:
+      - nvme_serial | default('') | length > 0
+      - osd_disk.serial == nvme_serial
+      - osd_disk.path == install_disk
+      - osd_disk.type == 'disk'
+      - osd_disk['log-sec'] | int == install_disk_logical_sector_bytes | int
+      - (osd_disk.size | int) // (osd_disk['log-sec'] | int) == install_disk_expected_sectors | int
+      - partition3_classification != 'unknown_or_unsafe'
+      - not inspection_p3_present | bool or system_end_lba | int < osd_partition3.start | int

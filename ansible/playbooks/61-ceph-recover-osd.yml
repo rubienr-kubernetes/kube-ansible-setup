@@ -1,0 +1,171 @@
+---
+- name: Reconcile one recognized existing OSD without initializing it
+  hosts: "{{ target_node | default('none') }}"
+  gather_facts: false
+  remote_user: kube
+  become: true
+  roles:
+    - role: osd_partition_inspection
+  tasks:
+    - name: Require explicit recovery authorization and existing Ceph identity
+      ansible.builtin.assert:
+        that:
+          - ceph_recover_osd_execute | default(false) | bool
+          - partition3_classification == 'existing_ceph_osd'
+          - rook_cephcluster_name | default('') | length > 0
+          - rook_ceph_image | default('') is match('^.+@sha256:[0-9a-f]{64}$')
+        fail_msg: Recovery never initializes absent, blank, or unknown media.
+
+    - name: Read current Rook CephCluster
+      ansible.builtin.command:
+        argv: [kubectl, --kubeconfig, /etc/kubernetes/admin.conf, -n, rook-ceph, get, cephcluster, "{{ rook_cephcluster_name }}", -o, json]
+      delegate_to: "{{ groups['control_plane'][0] }}"
+      become: true
+      register: recovered_cluster
+      changed_when: false
+
+    - name: Require a ready Rook control plane with explicit devices
+      ansible.builtin.assert:
+        that:
+          - (recovered_cluster.stdout | from_json).status.phase == 'Ready'
+          - (recovered_cluster.stdout | from_json).status.ceph.health != 'HEALTH_ERR'
+          - not ((recovered_cluster.stdout | from_json).spec.storage.useAllDevices | default(false) | bool)
+
+    - name: Render one read-only retained-label inspection Job
+      ansible.builtin.template:
+        src: "{{ playbook_dir }}/../roles/osd_partition_inspection/templates/ceph-label-job.yml.j2"
+        dest: "/tmp/ceph-label-{{ inventory_hostname }}.yml"
+        mode: '0600'
+      delegate_to: "{{ groups['control_plane'][0] }}"
+      become: true
+
+    - name: Read retained BlueStore identity with the pinned Rook Ceph image
+      block:
+        - name: Apply temporary read-only label Job
+          ansible.builtin.command:
+            argv: [kubectl, --kubeconfig, /etc/kubernetes/admin.conf, apply, -f, "/tmp/ceph-label-{{ inventory_hostname }}.yml"]
+          delegate_to: "{{ groups['control_plane'][0] }}"
+          become: true
+          changed_when: true
+
+        - name: Wait for retained-label inspection
+          ansible.builtin.command:
+            argv: [kubectl, --kubeconfig, /etc/kubernetes/admin.conf, -n, rook-ceph, wait, --for=condition=complete, --timeout=120s, "job/ceph-label-{{ inventory_hostname }}"]
+          delegate_to: "{{ groups['control_plane'][0] }}"
+          become: true
+          changed_when: false
+
+        - name: Read retained-label JSON
+          ansible.builtin.command:
+            argv: [kubectl, --kubeconfig, /etc/kubernetes/admin.conf, -n, rook-ceph, logs, "job/ceph-label-{{ inventory_hostname }}"]
+          delegate_to: "{{ groups['control_plane'][0] }}"
+          become: true
+          register: recovered_osd_label
+          changed_when: false
+      always:
+        - name: Delete temporary retained-label Job
+          ansible.builtin.command:
+            argv: [kubectl, --kubeconfig, /etc/kubernetes/admin.conf, -n, rook-ceph, delete, job, "ceph-label-{{ inventory_hostname }}", --ignore-not-found=true]
+          delegate_to: "{{ groups['control_plane'][0] }}"
+          become: true
+          changed_when: true
+
+        - name: Remove temporary retained-label manifest
+          ansible.builtin.file:
+            path: "/tmp/ceph-label-{{ inventory_hostname }}.yml"
+            state: absent
+          delegate_to: "{{ groups['control_plane'][0] }}"
+          become: true
+
+    - name: Parse retained OSD identity
+      ansible.builtin.set_fact:
+        recovered_osd: "{{ (recovered_osd_label.stdout | from_json).values() | first }}"
+
+    - name: Read running cluster FSID
+      ansible.builtin.command:
+        argv: [kubectl, --kubeconfig, /etc/kubernetes/admin.conf, -n, rook-ceph, exec, "deployment/{{ rook_toolbox_deployment | default('rook-ceph-tools') }}", --, ceph, fsid]
+      delegate_to: "{{ groups['control_plane'][0] }}"
+      become: true
+      register: running_ceph_fsid
+      changed_when: false
+
+    - name: Fail closed on cluster FSID mismatch
+      ansible.builtin.assert:
+        that:
+          - recovered_osd.ceph_fsid == running_ceph_fsid.stdout | trim
+          - recovered_osd.whoami | string is match('^[0-9]+$')
+          - recovered_osd.osd_uuid | default('') | length > 0
+        fail_msg: Retained OSD identity does not belong to the running cluster.
+
+    - name: Read retained partition PARTUUID
+      ansible.builtin.command:
+        argv: [lsblk, --noheadings, --nodeps, --output, PARTUUID, "{{ install_disk }}p3"]
+      register: recovered_osd_partuuid
+      changed_when: false
+
+    - name: Build exact retained Rook node-storage entry
+      ansible.builtin.set_fact:
+        recovered_osd_rook_node:
+          name: "{{ final_hostname }}"
+          devices:
+            - name: "/dev/disk/by-partuuid/{{ recovered_osd_partuuid.stdout | trim }}"
+
+    - name: Select any existing Rook entry for this recovered node
+      ansible.builtin.set_fact:
+        recovered_existing_nodes: >-
+          {{ (recovered_cluster.stdout | from_json).spec.storage.nodes | default([]) |
+             selectattr('name', 'equalto', final_hostname) | list }}
+
+    - name: Refuse a conflicting Rook recovery selection
+      ansible.builtin.assert:
+        that:
+          - recovered_existing_nodes | length <= 1
+          - >-
+            recovered_existing_nodes | length == 0 or
+            recovered_existing_nodes[0] == recovered_osd_rook_node
+
+    - name: Reconcile only the retained partition through Rook
+      ansible.builtin.command:
+        argv:
+          - kubectl
+          - --kubeconfig
+          - /etc/kubernetes/admin.conf
+          - -n
+          - rook-ceph
+          - patch
+          - cephcluster
+          - "{{ rook_cephcluster_name }}"
+          - --type=json
+          - -p
+          - "{{ [{'op': 'add', 'path': '/spec/storage/nodes/-', 'value': recovered_osd_rook_node}] | to_json }}"
+      delegate_to: "{{ groups['control_plane'][0] }}"
+      become: true
+      changed_when: true
+      when: recovered_existing_nodes | length == 0
+
+    - name: Wait for the same retained OSD ID to return up and in
+      ansible.builtin.command:
+        argv: [kubectl, --kubeconfig, /etc/kubernetes/admin.conf, -n, rook-ceph, exec, "deployment/{{ rook_toolbox_deployment | default('rook-ceph-tools') }}", --, ceph, osd, dump, -f, json]
+      delegate_to: "{{ groups['control_plane'][0] }}"
+      become: true
+      register: recovered_osd_dump
+      changed_when: false
+      retries: 60
+      delay: 10
+      until: >-
+        (recovered_osd_dump.stdout | from_json).osds |
+        selectattr('osd', 'equalto', recovered_osd.whoami | int) |
+        selectattr('uuid', 'equalto', recovered_osd.osd_uuid) |
+        selectattr('up', 'equalto', 1) |
+        selectattr('in', 'equalto', 1) | list | length == 1
+
+    - name: Wait for recovered cluster health to settle
+      ansible.builtin.command:
+        argv: [kubectl, --kubeconfig, /etc/kubernetes/admin.conf, -n, rook-ceph, exec, "deployment/{{ rook_toolbox_deployment | default('rook-ceph-tools') }}", --, ceph, status, -f, json]
+      delegate_to: "{{ groups['control_plane'][0] }}"
+      become: true
+      register: recovered_osd_health
+      changed_when: false
+      retries: 60
+      delay: 10
+      until: (recovered_osd_health.stdout | from_json).health.status == 'HEALTH_OK'

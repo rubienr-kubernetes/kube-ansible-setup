@@ -1,0 +1,170 @@
+---
+- name: Create or adopt only an empty partition for one new Rook OSD
+  hosts: "{{ target_node | default('none') }}"
+  gather_facts: false
+  remote_user: kube
+  become: true
+  roles:
+    - role: osd_partition_inspection
+  tasks:
+    - name: Require explicit new-OSD authorization and healthy Rook inputs
+      ansible.builtin.assert:
+        that:
+          - ceph_new_osd_execute | default(false) | bool
+          - rook_cephcluster_name | default('') | length > 0
+          - rook_toolbox_deployment | default('rook-ceph-tools') | length > 0
+          - partition3_classification in ['absent', 'blank']
+        fail_msg: New OSD provisioning is locked or this partition is not empty/new.
+
+    - name: Read current Rook CephCluster
+      ansible.builtin.command:
+        argv: [kubectl, --kubeconfig, /etc/kubernetes/admin.conf, -n, rook-ceph, get, cephcluster, "{{ rook_cephcluster_name }}", -o, json]
+      delegate_to: "{{ groups['control_plane'][0] }}"
+      become: true
+      register: new_osd_cluster
+      changed_when: false
+
+    - name: Require a ready, non-error Rook control plane before disk work
+      ansible.builtin.assert:
+        that:
+          - (new_osd_cluster.stdout | from_json).status.phase == 'Ready'
+          - (new_osd_cluster.stdout | from_json).status.ceph.health != 'HEALTH_ERR'
+          - not ((new_osd_cluster.stdout | from_json).spec.storage.useAllDevices | default(false) | bool)
+
+    - name: Display new-OSD boundary
+      ansible.builtin.debug:
+        msg:
+          node: "{{ inventory_hostname }}"
+          disk_serial: "{{ osd_disk.serial }}"
+          current_classification: "{{ partition3_classification }}"
+          new_partition: "{{ ceph_start_lba }}-{{ gpt_last_usable_lba }}"
+
+    - name: Require exact new-OSD confirmation
+      ansible.builtin.pause:
+        prompt: >-
+          Type exactly "NEW OSD {{ inventory_hostname }} SERIAL {{ nvme_serial }}
+          PARTITION 3 {{ ceph_start_lba }}-{{ gpt_last_usable_lba }}"
+      register: new_osd_confirmation
+      when: partition3_classification == 'absent'
+
+    - name: Validate exact new-OSD confirmation
+      ansible.builtin.assert:
+        that:
+          - >-
+            new_osd_confirmation.user_input ==
+            ('NEW OSD ' ~ inventory_hostname ~ ' SERIAL ' ~ nvme_serial ~
+             ' PARTITION 3 ' ~ ceph_start_lba | string ~ '-' ~ gpt_last_usable_lba | string)
+      when: partition3_classification == 'absent'
+
+    - name: Create fixed-size partition 3 ending at final usable LBA
+      ansible.builtin.command:
+        argv:
+          - sgdisk
+          - "--new=3:{{ ceph_start_lba }}:{{ gpt_last_usable_lba }}"
+          - "--typecode=3:{{ ceph_partition_type_guid }}"
+          - --change-name=3:ceph-osd
+          - "{{ install_disk }}"
+      changed_when: true
+      when: partition3_classification == 'absent'
+
+    - name: Settle new partition device
+      ansible.builtin.command:
+        argv: [udevadm, settle]
+      changed_when: false
+
+    - name: Read exact partition 3 PARTUUID
+      ansible.builtin.command:
+        argv: [lsblk, --noheadings, --nodeps, --output, PARTUUID, "{{ install_disk }}p3"]
+      register: new_osd_partuuid
+      changed_when: false
+
+    - name: Build exact Rook node-storage entry
+      ansible.builtin.set_fact:
+        new_osd_rook_node:
+          name: "{{ final_hostname }}"
+          devices:
+            - name: "/dev/disk/by-partuuid/{{ new_osd_partuuid.stdout | trim }}"
+
+    - name: Refuse whole-device or automatic Rook discovery
+      ansible.builtin.assert:
+        that:
+          - new_osd_rook_node.devices[0].name is match('^/dev/disk/by-partuuid/[0-9A-Fa-f-]+$')
+          - new_osd_rook_node.devices[0].name != install_disk
+
+    - name: Select any existing Rook entry for this node
+      ansible.builtin.set_fact:
+        new_osd_existing_nodes: >-
+          {{ (new_osd_cluster.stdout | from_json).spec.storage.nodes | default([]) |
+             selectattr('name', 'equalto', final_hostname) | list }}
+
+    - name: Refuse a conflicting existing Rook device selection
+      ansible.builtin.assert:
+        that:
+          - new_osd_existing_nodes | length <= 1
+          - >-
+            new_osd_existing_nodes | length == 0 or
+            new_osd_existing_nodes[0] == new_osd_rook_node
+
+    - name: Append exact partition to Rook CephCluster node selection
+      ansible.builtin.command:
+        argv:
+          - kubectl
+          - --kubeconfig
+          - /etc/kubernetes/admin.conf
+          - -n
+          - rook-ceph
+          - patch
+          - cephcluster
+          - "{{ rook_cephcluster_name }}"
+          - --type=json
+          - -p
+          - "{{ [{'op': 'add', 'path': '/spec/storage/nodes/-', 'value': new_osd_rook_node}] | to_json }}"
+      delegate_to: "{{ groups['control_plane'][0] }}"
+      become: true
+      changed_when: true
+      when: new_osd_existing_nodes | length == 0
+
+    - name: Wait for Ceph to report OSD metadata for this node
+      ansible.builtin.command:
+        argv: [kubectl, --kubeconfig, /etc/kubernetes/admin.conf, -n, rook-ceph, exec, "deployment/{{ rook_toolbox_deployment }}", --, ceph, osd, metadata, -f, json]
+      delegate_to: "{{ groups['control_plane'][0] }}"
+      become: true
+      register: new_osd_metadata_query
+      changed_when: false
+      retries: 60
+      delay: 10
+      until: >-
+        (new_osd_metadata_query.stdout | from_json) |
+        selectattr('hostname', 'equalto', final_hostname) | list | length == 1
+
+    - name: Extract the new OSD identity from cluster metadata
+      ansible.builtin.set_fact:
+        new_osd_metadata: >-
+          {{ (new_osd_metadata_query.stdout | from_json) |
+             selectattr('hostname', 'equalto', final_hostname) | list | first }}
+
+    - name: Wait for the same new OSD to be up and in
+      ansible.builtin.command:
+        argv: [kubectl, --kubeconfig, /etc/kubernetes/admin.conf, -n, rook-ceph, exec, "deployment/{{ rook_toolbox_deployment }}", --, ceph, osd, dump, -f, json]
+      delegate_to: "{{ groups['control_plane'][0] }}"
+      become: true
+      register: new_osd_dump
+      changed_when: false
+      retries: 60
+      delay: 10
+      until: >-
+        (new_osd_dump.stdout | from_json).osds |
+        selectattr('osd', 'equalto', new_osd_metadata.id | int) |
+        selectattr('up', 'equalto', 1) |
+        selectattr('in', 'equalto', 1) | list | length == 1
+
+    - name: Wait for Ceph health to settle
+      ansible.builtin.command:
+        argv: [kubectl, --kubeconfig, /etc/kubernetes/admin.conf, -n, rook-ceph, exec, "deployment/{{ rook_toolbox_deployment }}", --, ceph, status, -f, json]
+      delegate_to: "{{ groups['control_plane'][0] }}"
+      become: true
+      register: new_osd_health
+      changed_when: false
+      retries: 60
+      delay: 10
+      until: (new_osd_health.stdout | from_json).health.status == 'HEALTH_OK'

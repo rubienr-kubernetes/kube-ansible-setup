@@ -1,0 +1,32 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ceph-label-{{ inventory_hostname }}
+  namespace: rook-ceph
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: 120
+  template:
+    spec:
+      nodeName: {{ final_hostname }}
+      restartPolicy: Never
+      containers:
+        - name: inspect-label
+          image: {{ rook_ceph_image }}
+          command:
+            - ceph-bluestore-tool
+            - show-label
+            - --dev
+            - /dev/recovered-osd
+          securityContext:
+            privileged: true
+            readOnlyRootFilesystem: true
+          volumeDevices:
+            - name: retained-osd
+              devicePath: /dev/recovered-osd
+      volumes:
+        - name: retained-osd
+          hostPath:
+            path: {{ install_disk }}p3
+            type: BlockDevice
+
