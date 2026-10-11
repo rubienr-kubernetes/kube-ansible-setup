@@ -1,0 +1,11 @@
+/.agents/
+/.codex/
+/AGENTS.md
+/docs/
+/ansible/README.md
+/ansible/artifacts/
+/ansible/iso/*
+!/ansible/iso/.keep
+/ansible/.ansible/
+*.retry
+__pycache__/
