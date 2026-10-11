@@ -60,7 +60,7 @@ apply_state() {
 
     /usr/bin/cp --preserve=mode,ownership -- "$SSHD_CONFIG" "$backup"
     /usr/bin/printf '%s\n' \
-        '# Managed by /root/manage-root-ssh-access.' \
+        '# Managed by /root/manage-root-ssh-access.sh.' \
         '# Root passwords remain disabled; this controls public-key login only.' \
         "PermitRootLogin $desired" >"$temporary"
     /usr/bin/install -o root -g root -m 0644 -- "$temporary" "$SSHD_CONFIG"
@@ -83,7 +83,7 @@ apply_state() {
         die "effective PermitRootLogin is $observed; the previous state was restored"
     fi
 
-    /usr/bin/logger -t manage-root-ssh-access \
+    /usr/bin/logger -t manage-root-ssh-access.sh \
         "root SSH public-key access $expected by ${SUDO_USER:-root}"
     show_status
 }

@@ -124,7 +124,6 @@
             - {src: roles/host_baseline/templates/sudoers-kube.j2, dest: sudoers}
             - {src: roles/host_baseline/templates/10-kube-hardening.conf.j2, dest: sshd.conf}
             - {src: roles/host_baseline/templates/05-root-maintenance.conf.j2, dest: root-maintenance.conf}
-            - {src: roles/host_baseline/templates/manage-root-ssh-access.sh.j2, dest: manage-root-ssh-access}
             - {src: roles/kubernetes_node/templates/kubeadm-init.yaml.j2, dest: kubeadm.yaml}
             - {src: roles/user_environment/templates/bashrc.j2, dest: bashrc}
             - {src: roles/user_environment/templates/gitconfig.j2, dest: gitconfig}
@@ -133,11 +132,6 @@
         - name: Parse rendered Bash
           ansible.builtin.command:
             argv: [bash, -n, "{{ template_temp.path }}/bashrc"]
-          changed_when: false
-
-        - name: Parse rendered root-SSH access manager
-          ansible.builtin.command:
-            argv: [bash, -n, "{{ template_temp.path }}/manage-root-ssh-access"]
           changed_when: false
 
         - name: Read rendered generic live hostname

@@ -97,9 +97,9 @@
       notify: Restart sshd
 
     - name: Install the manual root-SSH access manager
-      ansible.builtin.template:
-        src: "{{ playbook_dir }}/../roles/host_baseline/templates/manage-root-ssh-access.sh.j2"
-        dest: /root/manage-root-ssh-access
+      ansible.builtin.copy:
+        src: "{{ playbook_dir }}/../roles/host_baseline/files/manage-root-ssh-access.sh"
+        dest: /root/manage-root-ssh-access.sh
         owner: root
         group: root
         mode: '0700'
