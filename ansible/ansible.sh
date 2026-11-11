@@ -89,6 +89,8 @@ run_syntax() {
 run_tests() {
     local fixture
 
+    python3 tests/test-install-firmware.py || die "installer firmware regression failed"
+
     printf '\n=== %s ===\n' tests/test-boot-installer-next.sh
     bash tests/test-boot-installer-next.sh || \
         die "shell regression failed: tests/test-boot-installer-next.sh"

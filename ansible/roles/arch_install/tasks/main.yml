@@ -136,15 +136,20 @@
       ansible.builtin.set_fact:
         install_boot_current: "{{ install_boot_current_matches | first }}"
 
-    - name: Refuse to delete the currently booted firmware entry
+    - name: Exclude BootCurrent from stale GRUB cleanup
+      ansible.builtin.set_fact:
+        install_grub_cleanup_entries: >-
+          {{ install_owned_grub_entries | reject('equalto', install_boot_current) | list }}
+
+    - name: Require cleanup to preserve the currently booted firmware entry
       ansible.builtin.assert:
         that:
-          - install_boot_current not in install_owned_grub_entries
+          - install_boot_current not in install_grub_cleanup_entries
 
-    - name: Delete only exact stale GRUB-owned entries
+    - name: Delete only noncurrent exact stale GRUB-owned entries
       ansible.builtin.command:
         argv: [efibootmgr, --bootnum, "{{ item }}", --delete-bootnum]
-      loop: "{{ install_owned_grub_entries }}"
+      loop: "{{ install_grub_cleanup_entries }}"
       changed_when: true
 
     - name: Delete existing OS partition entries only
@@ -457,7 +462,7 @@
 
     - name: Install GRUB in UEFI mode
       ansible.builtin.command:
-        argv: [arch-chroot, /mnt, grub-install, --target=x86_64-efi, --efi-directory=/boot, --bootloader-id=GRUB]
+        argv: [arch-chroot, /mnt, grub-install, --target=x86_64-efi, --efi-directory=/boot, --bootloader-id=GRUB, --no-nvram]
       changed_when: true
 
     - name: Install firmware-independent GRUB fallback loader
@@ -703,6 +708,19 @@
           - (install_post_boot_current_matches | first) == install_new_grub_entry
           - install_new_grub_entry not in install_obsolete_archiso_entries
         fail_msg: The reboot did not return through the verified new-ESP GRUB entry; installer entries were not removed.
+
+    - name: Select stale GRUB entries after verified installed-system boot
+      ansible.builtin.set_fact:
+        install_post_boot_stale_grub_entries: >-
+          {{ install_efi_post_boot.stdout |
+             regex_findall('(?im)^Boot([0-9a-f]{4})[*]?[ \t]+GRUB(?:[ \t]+|$).*$') |
+             map('upper') | reject('equalto', install_new_grub_entry) | list }}
+
+    - name: Remove noncurrent exact GRUB entries after successful handoff
+      ansible.builtin.command:
+        argv: [efibootmgr, --bootnum, "{{ item }}", --delete-bootnum]
+      loop: "{{ install_post_boot_stale_grub_entries }}"
+      changed_when: true
 
     - name: Remove exact obsolete Kube ArchISO USB entries
       ansible.builtin.command:
