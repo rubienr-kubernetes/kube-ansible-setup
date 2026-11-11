@@ -16,10 +16,10 @@ Usage:
   $PROGRAM doctor
   $PROGRAM validate
   $PROGRAM inventory [HOST]
-  $PROGRAM install-iso [HOST]
-  $PROGRAM bootstrap-host [HOST]
-  $PROGRAM configure-host [HOST]
-  $PROGRAM prepare-kubernetes [HOST]
+  $PROGRAM install-iso [HOST] [--connect ADDRESS]
+  $PROGRAM bootstrap-host [HOST] [--connect ADDRESS]
+  $PROGRAM configure-host [HOST] [--connect ADDRESS]
+  $PROGRAM prepare-kubernetes [HOST] [--connect ADDRESS]
   $PROGRAM {-h|--help}
 
 Commands:
@@ -29,6 +29,8 @@ Commands:
   inventory       Show the inventory graph, or resolved variables for HOST.
   install-iso     With no HOST, list installable inventory targets. With HOST,
                   require inspection, then run the exactly gated installation.
+                  --connect selects the live installer (default kube-installer).
+                  The supplied address is used verbatim; reboot returns to inventory FQDN.
   bootstrap-host  With no HOST, list host targets. With HOST, create the
                   permanent administrator, install the host package baseline,
                   and retain manually gated root key SSH. Never runs kubeadm.
@@ -38,7 +40,20 @@ Commands:
                   With no HOST, list host targets. With HOST, perform a full
                   Arch upgrade, configure and validate CRI-O, reboot, and
                   leave kubelet stopped. Never runs kubeadm init or join.
+
+  --connect ADDRESS selects the initial connection endpoint. For install-iso
+  this is the live installer; other lifecycle commands target the installed OS.
 EOF
+}
+
+parse_connect() {
+    connect_address=""
+    if (($#)); then
+        [[ $# == 2 && $1 == --connect ]] || die "expected optional --connect ADDRESS after HOST"
+        [[ $2 =~ ^[a-zA-Z0-9]([a-zA-Z0-9.-]*[a-zA-Z0-9])?$ ]] || \
+            die "--connect requires an IPv4 address or hostname, without user, port, or whitespace"
+        connect_address=$2
+    fi
 }
 
 require_unprivileged() {
@@ -89,6 +104,7 @@ run_syntax() {
 run_tests() {
     local fixture
 
+    python3 tests/test-install-connect.py || die "installer connection regression failed"
     python3 tests/test-install-firmware.py || die "installer firmware regression failed"
 
     printf '\n=== %s ===\n' tests/test-boot-installer-next.sh
@@ -116,10 +132,9 @@ show_inventory() {
 }
 
 run_install_iso() (
-    local target inventory_record candidate found known_hosts_file
+    local target inventory_record candidate found known_hosts_file ssh_control_dir="" connect_address="" installed_address
     local -a connection_args target_args
 
-    (($# <= 1)) || die "install-iso accepts at most one inventory host"
     if (($# == 0)); then
         found=false
         printf 'Available installation targets:\n'
@@ -141,6 +156,8 @@ run_install_iso() (
     fi
 
     target=$1
+    shift
+    parse_connect "$@"
     [[ $target =~ ^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$ ]] || \
         die "install-iso target must be one literal lowercase hostname"
 
@@ -149,15 +166,34 @@ run_install_iso() (
     grep -q '"nvme_serial"' <<<"$inventory_record" || \
         die "install-iso target is absent or lacks an installation-disk identity: $target"
 
+    connect_address=${connect_address:-kube-installer}
+    installed_address=$(python3 -c \
+        'import json, sys; v=json.load(sys.stdin); print(v["final_hostname"] + "." + v["local_domain"])' \
+        <<<"$inventory_record") || die "inventory requires final_hostname and local_domain"
+    [[ $installed_address =~ ^[a-zA-Z0-9]([a-zA-Z0-9.-]*[a-zA-Z0-9])?$ ]] || die "invalid installed hostname in inventory"
+
     known_hosts_file=$(mktemp /tmp/kube-live-install-known-hosts.XXXXXX) || \
         die "could not create a private installation known-hosts file"
     chmod 0600 "$known_hosts_file"
-    trap 'rm -f -- "$known_hosts_file"' EXIT
+    trap 'rm -f -- "$known_hosts_file"; if [[ -n $ssh_control_dir ]]; then rm -rf -- "$ssh_control_dir"; fi' EXIT
+
+    ssh_control_dir=$(mktemp -d /tmp/kube-install-ssh.XXXXXX) || \
+        die "could not create a private installation SSH socket directory"
+    chmod 0700 "$ssh_control_dir"
 
     connection_args=(
-        "--ssh-common-args=-F /dev/null -o UserKnownHostsFile=$known_hosts_file -o StrictHostKeyChecking=accept-new"
+        "--ssh-common-args=-F /dev/null -o UserKnownHostsFile=$known_hosts_file -o HostKeyAlias=$target -o StrictHostKeyChecking=accept-new"
     )
-    target_args=(-e "target_node=$target" -e ansible_user=root)
+    target_args=(
+        -e "target_node=$target"
+        -e ansible_user=root
+        -e "installer_connect_host=$connect_address"
+        -e "installer_destination_host=$installed_address"
+        -e "ansible_ssh_args=-C -o ControlMaster=no -o ControlPath=none"
+        -e "ansible_control_path_dir=$ssh_control_dir"
+        -e 'ansible_control_path=%(directory)s/%%C'
+    )
+    printf 'Live connection: %s; installed connection: %s\n' "$connect_address" "$installed_address"
 
     printf '\n=== prerequisite: inspect live ISO target %s ===\n' "$target"
     ansible-playbook playbooks/20-inspect-live-iso.yml \
@@ -171,10 +207,9 @@ run_install_iso() (
 )
 
 run_bootstrap_host() (
-    local target target_address inventory_record candidate found known_hosts_file confirmation expected
+    local target target_address inventory_record candidate found known_hosts_file confirmation expected connect_address=""
     local -a connection_args target_args
 
-    (($# <= 1)) || die "bootstrap-host accepts at most one inventory host"
     if (($# == 0)); then
         found=false
         printf 'Available node-bootstrap targets:\n'
@@ -196,6 +231,8 @@ run_bootstrap_host() (
     fi
 
     target=$1
+    shift
+    parse_connect "$@"
     [[ $target =~ ^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$ ]] || \
         die "bootstrap-host target must be one literal lowercase hostname"
 
@@ -207,6 +244,7 @@ run_bootstrap_host() (
         'import json, sys; print(json.load(sys.stdin)["ansible_host"])' \
         <<<"$inventory_record") || \
         die "could not resolve the management address for: $target"
+    target_address=${connect_address:-$target_address}
     [[ -n $target_address ]] || die "empty management address for: $target"
 
     printf '\nThis changes packages and access policy on %s.\n' "$target"
@@ -240,15 +278,18 @@ run_bootstrap_host() (
         -e "bootstrap_known_hosts_file=$known_hosts_file"
     )
 
+    if [[ -n $connect_address ]]; then
+        target_args+=(-e "ansible_host=$connect_address")
+    fi
+
     ansible-playbook playbooks/40-bootstrap-host.yml \
         "${connection_args[@]}" "${target_args[@]}"
 )
 
 run_configure_host() (
-    local target inventory_record candidate found known_hosts_file confirmation expected
+    local target inventory_record candidate found known_hosts_file confirmation expected connect_address=""
     local -a connection_args target_args
 
-    (($# <= 1)) || die "configure-host accepts at most one inventory host"
     if (($# == 0)); then
         found=false
         printf 'Available node-configuration targets:\n'
@@ -270,6 +311,8 @@ run_configure_host() (
     fi
 
     target=$1
+    shift
+    parse_connect "$@"
     [[ $target =~ ^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$ ]] || \
         die "configure-host target must be one literal lowercase hostname"
 
@@ -298,15 +341,18 @@ run_configure_host() (
         -e configure_node_execute=true
     )
 
+    if [[ -n $connect_address ]]; then
+        target_args+=(-e "ansible_host=$connect_address")
+    fi
+
     ansible-playbook playbooks/41-configure-host.yml \
         "${connection_args[@]}" "${target_args[@]}"
 )
 
 run_prepare_kubernetes() (
-    local target inventory_record candidate found known_hosts_file confirmation expected
+    local target inventory_record candidate found known_hosts_file confirmation expected connect_address=""
     local -a connection_args target_args
 
-    (($# <= 1)) || die "prepare-kubernetes accepts at most one inventory host"
     if (($# == 0)); then
         found=false
         printf 'Available Kubernetes-preparation targets:\n'
@@ -328,6 +374,8 @@ run_prepare_kubernetes() (
     fi
 
     target=$1
+    shift
+    parse_connect "$@"
     [[ $target =~ ^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$ ]] || \
         die "prepare-kubernetes target must be one literal lowercase hostname"
 
@@ -358,6 +406,10 @@ run_prepare_kubernetes() (
         -e ansible_user=root
         -e prepare_kubernetes_node_execute=true
     )
+
+    if [[ -n $connect_address ]]; then
+        target_args+=(-e "ansible_host=$connect_address")
+    fi
 
     ansible-playbook playbooks/50-prepare-kubernetes-node.yml \
         "${connection_args[@]}" "${target_args[@]}"

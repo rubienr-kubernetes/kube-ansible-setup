@@ -5,6 +5,20 @@
   register: live_iso_present
   failed_when: false
 
+- name: Read the connected system hostname
+  ansible.builtin.command:
+    argv: [cat, /etc/hostname]
+  register: inspection_connected_hostname
+  changed_when: false
+  failed_when: false
+
+- name: Read the connected system boot arguments
+  ansible.builtin.command:
+    argv: [cat, /proc/cmdline]
+  register: inspection_connected_cmdline
+  changed_when: false
+  failed_when: false
+
 - name: Detect UEFI boot mode
   ansible.builtin.stat:
     path: /sys/firmware/efi
@@ -112,6 +126,10 @@
 - name: Print complete inspection report before policy assertions
   ansible.builtin.debug:
     msg:
+      connection_endpoint: "{{ ansible_host | default(inventory_hostname) }}"
+      connected_hostname: "{{ inspection_connected_hostname.stdout | default('unavailable', true) }}"
+      connected_boot_arguments: "{{ inspection_connected_cmdline.stdout | default('unavailable', true) }}"
+      live_iso_detection: "{{ live_iso_present }}"
       live_iso: "{{ live_iso_present.stat.exists | default(false) }}"
       uefi: "{{ live_uefi_present.stat.exists | default(false) }}"
       cpu: "{{ inspection_cpu.stdout | default('unavailable', true) }}"

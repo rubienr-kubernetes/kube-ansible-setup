@@ -4,6 +4,17 @@
   gather_facts: false
   remote_user: root
   become: false
+  pre_tasks:
+    - name: Remember the installed-system destination address
+      ansible.builtin.set_fact:
+        installer_installed_host: "{{ installer_destination_host | default(final_hostname ~ '.' ~ local_domain) }}"
+      when: installer_connect_host is defined
+
+    - name: Select the explicit live-installer connection address
+      ansible.builtin.set_fact:
+        ansible_host: "{{ installer_connect_host }}"
+      when: installer_connect_host is defined
+
   roles:
     - role: live_node_inspection
     - role: arch_install

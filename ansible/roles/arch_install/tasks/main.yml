@@ -657,7 +657,48 @@
   ansible.builtin.reboot:
     reboot_timeout: 600
     connect_timeout: 10
-  when: install_reboot | default(true) | bool
+  when:
+    - install_reboot | default(true) | bool
+    - installer_connect_host is not defined
+
+- name: Hand off from the live installer to the installed-system address
+  when:
+    - install_reboot | default(true) | bool
+    - installer_connect_host is defined
+  block:
+    - name: Read the live boot identity
+      ansible.builtin.command: cat /proc/sys/kernel/random/boot_id
+      register: installer_live_boot_id
+      changed_when: false
+
+    - name: Schedule installed-system boot without waiting at the live address
+      ansible.builtin.shell: sleep 3 && /usr/bin/systemctl reboot
+      async: 30
+      poll: 0
+      changed_when: true
+
+    - name: Select the installed-system destination address
+      ansible.builtin.set_fact:
+        ansible_host: "{{ installer_installed_host }}"
+
+    - name: Discard the live SSH connection
+      ansible.builtin.meta: reset_connection
+
+    - name: Allow the scheduled reboot to begin
+      ansible.builtin.pause:
+        seconds: 5
+
+    - name: Wait for SSH at the installed-system address
+      ansible.builtin.wait_for_connection:
+        timeout: 600
+
+    - name: Require a new boot at the installed-system address
+      ansible.builtin.command: cat /proc/sys/kernel/random/boot_id
+      register: installer_new_boot_id
+      changed_when: false
+      until: installer_new_boot_id.stdout != installer_live_boot_id.stdout
+      retries: 60
+      delay: 5
 
 - name: Wait for the installed node
   ansible.builtin.wait_for_connection:

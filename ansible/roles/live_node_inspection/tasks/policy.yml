@@ -15,4 +15,8 @@
       - >-
         not inspection_p3_present | bool or
         system_end_lba | int < inspection_partition3.start | int
-    fail_msg: The printed inspection report violates installation policy; no write is permitted.
+    fail_msg: >-
+      The printed inspection report violates installation policy; no write is
+      permitted. Connected endpoint={{ ansible_host | default(inventory_hostname) }},
+      hostname={{ inspection_connected_hostname.stdout | default('unavailable', true) }}.
+      ArchISO detection={{ live_iso_present }}.
