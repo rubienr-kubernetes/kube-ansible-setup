@@ -17,6 +17,7 @@ Usage:
   $PROGRAM validate
   $PROGRAM inventory [HOST]
   $PROGRAM install-iso [HOST] [--connect ADDRESS]
+  $PROGRAM boot-installer HOST [--connect ADDRESS] [--iso IMAGE.iso] [--live-connect ADDRESS]
   $PROGRAM bootstrap-host [HOST] [--connect ADDRESS]
   $PROGRAM configure-host [HOST] [--connect ADDRESS]
   $PROGRAM prepare-kubernetes [HOST] [--connect ADDRESS]
@@ -31,6 +32,11 @@ Commands:
                   require inspection, then run the exactly gated installation.
                   --connect selects the live installer (default kube-installer).
                   The supplied address is used verbatim; reboot returns to inventory FQDN.
+  boot-installer  Stage a verified built ISO on an installed node, confirm,
+                  kexec into RAM, and verify identity and disk release.
+                  Never formats or invokes installation. --conenct is accepted
+                  as an alias for --connect. --live-connect selects the live
+                  discovery name (default HOST-installer.local), not the initial host.
   bootstrap-host  With no HOST, list host targets. With HOST, create the
                   permanent administrator, install the host package baseline,
                   and retain manually gated root key SSH. Never runs kubeadm.
@@ -106,6 +112,7 @@ run_tests() {
 
     python3 tests/test-install-connect.py || die "installer connection regression failed"
     python3 tests/test-install-firmware.py || die "installer firmware regression failed"
+    python3 tests/test-boot-installer.py || die "boot-installer regression failed"
 
     printf '\n=== %s ===\n' tests/test-boot-installer-next.sh
     bash tests/test-boot-installer-next.sh || \
@@ -204,6 +211,68 @@ run_install_iso() (
     ansible-playbook playbooks/30-install-live-iso.yml \
         "${connection_args[@]}" "${target_args[@]}" \
         -e install_execute=true
+)
+
+run_boot_installer() (
+    local target connect_address="" live_address="" iso="" run_dir inventory_record option value
+    local -a images=()
+    (($#)) || die "usage: boot-installer HOST [--connect ADDRESS] [--iso IMAGE.iso] [--live-connect ADDRESS]"
+    target=$1
+    shift
+    [[ $target =~ ^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$ ]] || die "boot-installer requires one literal inventory hostname"
+    while (($#)); do
+        (($# >= 2)) || die "missing value for: $1"
+        option=$1
+        value=$2
+        case $option in
+            --connect|--conenct)
+                [[ -z $connect_address ]] || die "--connect may be specified only once"
+                parse_connect --connect "$value"
+                ;;
+            --live-connect)
+                [[ $value =~ ^[a-zA-Z0-9]([a-zA-Z0-9.-]*[a-zA-Z0-9])?$ ]] || die "invalid live connection address"
+                live_address=$value
+                ;;
+            --iso)
+                [[ -z $iso && -n $value ]] || die "--iso requires one nonempty path"
+                iso=$value
+                ;;
+            *) die "unknown boot-installer argument: $option" ;;
+        esac
+        shift 2
+    done
+    ((${#target} <= 53)) || die "inventory hostname is too long for the -installer suffix"
+    live_address=${live_address:-${target}-installer.local}
+    inventory_record=$(ansible-inventory --host "$target") || die "could not resolve inventory host: $target"
+    grep -q '"nvme_serial"' <<<"$inventory_record" || die "inventory target lacks a disk identity: $target"
+    if [[ -z $iso ]]; then
+        shopt -s nullglob
+        images=("$SCRIPT_DIR"/iso/*-kube-installer.iso)
+        ((${#images[@]} == 1)) || die "expected one built installer ISO; run ./archiso.sh create if absent, or select one with --iso"
+        iso=${images[0]}
+    fi
+    iso=$(realpath -e -- "$iso") || die "ISO not found"
+    [[ -f $iso ]] || die "ISO is not a regular file"
+    "$SCRIPT_DIR/archiso.sh" verify --iso "$iso" || die "ISO verification failed; no host was contacted"
+    run_dir=$(mktemp -d /tmp/kube-boot-installer.XXXXXX) || die "could not create private run directory"
+    chmod 0700 "$run_dir"
+    trap 'rm -rf -- "$run_dir"' EXIT
+    python3 - "$run_dir/vars.json" "$target" "$connect_address" "$live_address" "$iso" <<'JSON'
+import json
+import sys
+from pathlib import Path
+path, target, connect, live, iso = sys.argv[1:]
+values = dict(target_node=target, ansible_user='root', boot_installer_execute=True,
+              boot_installer_connect=connect, boot_installer_live_connect=live,
+              boot_installer_iso=iso,
+              ansible_ssh_args='-C -o ControlMaster=no -o ControlPath=none')
+Path(path).write_text(json.dumps(values))
+JSON
+    printf 'Inventory identity: %s; initial connection: %s; live discovery: %s\n' \
+        "$target" "${connect_address:-inventory address}" "$live_address"
+    ansible-playbook playbooks/25-boot-installer.yml \
+        "--extra-vars=@$run_dir/vars.json" \
+        "--ssh-common-args=-F /dev/null -o UserKnownHostsFile=$run_dir/installed_known_hosts -o StrictHostKeyChecking=accept-new"
 )
 
 run_bootstrap_host() (
@@ -443,6 +512,10 @@ main() {
         install-iso)
             shift
             run_install_iso "$@"
+            ;;
+        boot-installer)
+            shift
+            run_boot_installer "$@"
             ;;
         bootstrap-host)
             shift

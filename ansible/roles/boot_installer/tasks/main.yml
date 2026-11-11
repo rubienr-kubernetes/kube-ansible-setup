@@ -1,0 +1,326 @@
+---
+- name: Validate the per-node live hostname before preparation
+  ansible.builtin.assert:
+    that:
+      - inventory_hostname is match('^[a-z0-9]([a-z0-9-]{0,51}[a-z0-9])?$')
+    fail_msg: Inventory hostname must fit the DNS label with the -installer suffix.
+
+- name: Select the per-node live hostname
+  ansible.builtin.set_fact:
+    boot_live_hostname: "{{ inventory_hostname }}-installer"
+
+- name: Verify the controller ISO using the existing checksum contract
+  ansible.builtin.command:
+    argv: ["{{ playbook_dir }}/../archiso.sh", verify, --iso, "{{ boot_installer_iso }}"]
+  delegate_to: localhost
+  changed_when: false
+
+- name: Record the verified ISO checksum and size
+  ansible.builtin.stat:
+    path: "{{ boot_installer_iso }}"
+    checksum_algorithm: sha256
+  delegate_to: localhost
+  register: boot_iso
+
+- name: Read the ISO live-filesystem checksum
+  ansible.builtin.command:
+    argv: [bsdtar, -xOf, "{{ boot_installer_iso }}", arch/x86_64/airootfs.sha512]
+  delegate_to: localhost
+  changed_when: false
+  register: boot_root_checksum
+
+- name: Require the supported ISO filesystem checksum record
+  ansible.builtin.assert:
+    that:
+      - boot_root_checksum.stdout is match('^[0-9a-f]{128}  airootfs[.]sfs$')
+    fail_msg: This workflow requires the built x86_64 SquashFS ArchISO.
+
+- name: Inspect installed identity and handoff prerequisites without changing the node
+  ansible.builtin.command:
+    argv:
+      - python3
+      - -c
+      - "{{ lookup('file', role_path ~ '/files/state.py') }}"
+      - installed
+      - "{{ install_disk }}"
+      - "{{ nvme_serial }}"
+      - "{{ management_mac }}"
+      - "{{ boot_iso.stat.size | string }}"
+  changed_when: false
+  register: boot_before_json
+
+- name: Record the observed installed system and staging path
+  ansible.builtin.set_fact:
+    boot_before: "{{ boot_before_json.stdout | from_json }}"
+    boot_stage: "/root/kube-boot-installer/{{ boot_iso.stat.checksum }}"
+    boot_sha512: "{{ boot_root_checksum.stdout.split()[0] }}"
+
+- name: Require the expected installed hostname
+  ansible.builtin.assert:
+    that:
+      - boot_before.hostname == final_hostname
+    fail_msg: The connected installed hostname does not match inventory; nothing has been staged.
+
+- name: Display preparation scope and recovery
+  ansible.builtin.debug:
+    msg:
+      target: "{{ inventory_hostname }}"
+      connected_via: "{{ ansible_host }}"
+      observed_addresses: "{{ boot_before.addresses }}"
+      verified_serial: "{{ nvme_serial }}"
+      iso: "{{ boot_installer_iso }}"
+      sha256: "{{ boot_iso.stat.checksum }}"
+      stage: "{{ boot_stage }}"
+      changes: Complete Arch package transaction for kexec-tools, ISO staging, then separately confirmed reboot into RAM.
+      recovery: >-
+        The installed OS and GRUB are retained. Before handoff, kexec --unload
+        cancels a loaded target. After handoff, normal reboot returns to disk.
+        If SSH fails, use physical console/power or USB recovery. No formatting runs.
+
+- name: Confirm preparation and recovery access
+  ansible.builtin.pause:
+    prompt: >-
+      Confirm independent power/console recovery is available.
+      Type exactly "PREPARE INSTALLER {{ inventory_hostname }}" to install dependencies and stage the ISO
+  register: boot_prepare_confirmation
+
+- name: Require exact preparation confirmation
+  ansible.builtin.assert:
+    that:
+      - boot_prepare_confirmation.user_input == 'PREPARE INSTALLER ' ~ inventory_hostname
+
+- name: Install kexec-tools with one complete Arch transaction
+  ansible.builtin.command:
+    argv: [pacman, --sync, --refresh, --sysupgrade, --needed, --noconfirm, kexec-tools]
+  changed_when: true
+
+- name: Record installed kexec and kernel packages
+  ansible.builtin.command:
+    argv: [pacman, -Q, kexec-tools, linux]
+  changed_when: false
+  register: boot_packages
+
+- name: Reject unexpected preexisting staging objects
+  ansible.builtin.stat:
+    path: "{{ item }}"
+    follow: false
+  loop:
+    - /root/kube-boot-installer
+    - "{{ boot_stage }}"
+  register: boot_stage_stats
+
+- name: Require root-owned private staging directories when present
+  ansible.builtin.assert:
+    that:
+      - >-
+        not item.stat.exists or
+        (item.stat.isdir | default(false) and not item.stat.islnk | default(false)
+        and item.stat.uid == 0 and item.stat.mode == '0700')
+  loop: "{{ boot_stage_stats.results }}"
+
+- name: Create private content-addressed staging directories
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    owner: root
+    group: root
+    mode: '0700'
+  loop:
+    - /root/kube-boot-installer
+    - "{{ boot_stage }}"
+
+- name: Stage the verified ISO
+  ansible.builtin.copy:
+    src: "{{ boot_installer_iso }}"
+    dest: "{{ boot_stage }}/installer.iso"
+    owner: root
+    group: root
+    mode: '0600'
+
+- name: Stage the ISO checksum
+  ansible.builtin.copy:
+    content: "{{ boot_iso.stat.checksum }}  installer.iso\n"
+    dest: "{{ boot_stage }}/installer.iso.sha256"
+    mode: '0600'
+
+- name: Verify the transferred ISO before extracting or loading
+  ansible.builtin.command:
+    argv: [sha256sum, -c, installer.iso.sha256]
+    chdir: "{{ boot_stage }}"
+  changed_when: false
+
+- name: Extract only the matching kernel and initramfs from that ISO
+  ansible.builtin.command:
+    argv:
+      - bsdtar
+      - -xf
+      - installer.iso
+      - arch/boot/x86_64/vmlinuz-linux
+      - arch/boot/x86_64/initramfs-linux.img
+    chdir: "{{ boot_stage }}"
+  changed_when: true
+
+- name: Require nonempty regular boot files
+  ansible.builtin.stat:
+    path: "{{ boot_stage }}/arch/boot/x86_64/{{ item }}"
+    follow: false
+  loop: [vmlinuz-linux, initramfs-linux.img]
+  register: boot_files
+
+- name: Validate extracted boot files
+  ansible.builtin.assert:
+    that:
+      - item.stat.isreg | default(false)
+      - not item.stat.islnk | default(false)
+      - item.stat.size | default(0) | int > 0
+  loop: "{{ boot_files.results }}"
+
+- name: Prepare explicit ISO discovery and RAM filesystem arguments
+  ansible.builtin.set_fact:
+    boot_command_line: >-
+      archisobasedir=arch img_dev=/dev/disk/by-uuid/{{ boot_before.uuid }}
+      img_flags=subvol=@ img_loop={{ boot_stage }}/installer.iso
+      copytoram=y checksum=y cow_spacesize=1G ipv6.disable=1
+      systemd.hostname={{ boot_live_hostname }}
+
+- name: Save the reviewable boot arguments
+  ansible.builtin.copy:
+    content: "{{ boot_command_line }}\n"
+    dest: "{{ boot_stage }}/boot-command-line.txt"
+    mode: '0600'
+
+- name: Display the staged handoff
+  ansible.builtin.debug:
+    msg:
+      target: "{{ inventory_hostname }}"
+      packages: "{{ boot_packages.stdout_lines }}"
+      command_line: "{{ boot_command_line }}"
+      result: Reboot to the RAM installer only; never start install-iso automatically.
+      ssh_identity: >-
+        The live ISO generates a new SSH host key. Read-only probes use fresh
+        first-contact trust and verify serial, management MAC, boot ID and RAM
+        state. This is not cryptographic continuity with the installed host key.
+
+- name: Require exact handoff confirmation
+  ansible.builtin.pause:
+    prompt: >-
+      SSH will disconnect. Type exactly "BOOT INSTALLER {{ inventory_hostname }} SERIAL {{ nvme_serial }}"
+      to load the staged kernel and perform the orderly kexec handoff
+  register: boot_handoff_confirmation
+
+- name: Verify handoff confirmation before loading a kernel
+  ansible.builtin.assert:
+    that:
+      - boot_handoff_confirmation.user_input == 'BOOT INSTALLER ' ~ inventory_hostname ~ ' SERIAL ' ~ nvme_serial
+
+- name: Recheck installed identity and unloaded kexec state immediately before loading
+  ansible.builtin.command:
+    argv:
+      - python3
+      - -c
+      - "{{ lookup('file', role_path ~ '/files/state.py') }}"
+      - installed
+      - "{{ install_disk }}"
+      - "{{ nvme_serial }}"
+      - "{{ management_mac }}"
+      - "{{ boot_iso.stat.size | string }}"
+  changed_when: false
+  register: boot_recheck
+
+- name: Require unchanged boot and filesystem identity
+  ansible.builtin.assert:
+    that:
+      - (boot_recheck.stdout | from_json).boot_id == boot_before.boot_id
+      - (boot_recheck.stdout | from_json).uuid == boot_before.uuid
+
+- name: Reverify the staged ISO immediately before handoff
+  ansible.builtin.command:
+    argv: [sha256sum, -c, installer.iso.sha256]
+    chdir: "{{ boot_stage }}"
+  changed_when: false
+
+- name: Load and schedule the orderly handoff
+  block:
+    - name: Load the verified matching kernel and initramfs
+      ansible.builtin.command:
+        argv:
+          - kexec
+          - --load
+          - "{{ boot_stage }}/arch/boot/x86_64/vmlinuz-linux"
+          - "--initrd={{ boot_stage }}/arch/boot/x86_64/initramfs-linux.img"
+          - "--command-line={{ boot_command_line }}"
+      changed_when: true
+
+    - name: Record ownership of this loaded kernel
+      ansible.builtin.set_fact:
+        boot_loaded_by_this_run: true
+
+    - name: Verify the kernel was loaded
+      ansible.builtin.command:
+        argv: [cat, /sys/kernel/kexec_loaded]
+      changed_when: false
+      register: boot_loaded
+      failed_when: boot_loaded.stdout | trim != '1'
+
+    - name: Flush staging data before handoff
+      ansible.builtin.command:
+        argv: [sync]
+      changed_when: false
+
+    - name: Schedule orderly kexec after the SSH task returns
+      ansible.builtin.command:
+        argv:
+          - systemd-run
+          - --unit=kube-boot-installer-handoff
+          - --on-active=5s
+          - /usr/bin/systemctl
+          - kexec
+          - --no-block
+      changed_when: true
+
+  rescue:
+    - name: Unload only the kernel loaded by this failed run
+      ansible.builtin.command:
+        argv: [kexec, --unload]
+      when: boot_loaded_by_this_run | default(false) | bool
+      changed_when: true
+
+    - name: Stop after failed loading or scheduling
+      ansible.builtin.fail:
+        msg: >-
+          Kernel loading or handoff scheduling failed. Inspect the original error.
+          Staged files and the installed OS are retained; no installation ran.
+
+- name: Discard the installed-system SSH connection
+  ansible.builtin.meta: reset_connection
+
+- name: Find and verify the same node in the RAM installer
+  ansible.builtin.command:
+    argv:
+      - python3
+      - "{{ role_path }}/files/reconnect.py"
+      - --state-script
+      - "{{ role_path }}/files/state.py"
+      - --candidates
+      - "{{ (boot_before.addresses + [boot_installer_live_connect | default(boot_live_hostname ~ '.local')]) | unique | list | to_json }}"
+      - --disk
+      - "{{ install_disk }}"
+      - --serial
+      - "{{ nvme_serial }}"
+      - --mac
+      - "{{ management_mac }}"
+      - --hostname
+      - "{{ boot_live_hostname }}"
+      - --old-boot
+      - "{{ boot_before.boot_id }}"
+      - --sha512
+      - "{{ boot_sha512 }}"
+  delegate_to: localhost
+  async: 750
+  poll: 5
+  changed_when: false
+  register: boot_live_report
+
+- name: Report verified live installer without invoking installation
+  ansible.builtin.debug:
+    msg: "{{ boot_live_report.stdout | from_json }}"

@@ -1,0 +1,25 @@
+---
+- name: Hand one installed node over to the verified ArchISO without installation
+  hosts: "{{ target_node | default('none') }}"
+  gather_facts: false
+  remote_user: root
+  become: false
+  pre_tasks:
+    - name: Require an explicit boot-installer gate and one inventory target
+      ansible.builtin.assert:
+        that:
+          - boot_installer_execute | default(false) | bool
+          - target_node in groups['kube_nodes']
+          - ansible_play_hosts_all | length == 1
+          - boot_installer_iso | default('') | length > 0
+          - nvme_serial | length > 0
+          - management_mac | length > 0
+        fail_msg: Use ansible.sh boot-installer HOST with a verified built ISO.
+
+    - name: Select an optional installed-system connection override
+      ansible.builtin.set_fact:
+        ansible_host: "{{ boot_installer_connect }}"
+      when: boot_installer_connect | default('') | length > 0
+
+  roles:
+    - role: boot_installer
