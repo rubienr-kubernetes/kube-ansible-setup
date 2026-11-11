@@ -114,7 +114,7 @@
             - {src: roles/host_configuration/templates/10-ipv4-only.cfg.j2, dest: ipv4-only-grub.cfg}
             - {src: roles/host_configuration/templates/20-management.network.j2, dest: configured-management.network}
             - {src: roles/host_configuration/templates/20-cluster.network.j2, dest: configured-cluster.network}
-            - {src: roles/host_configuration/templates/avahi-daemon.conf.j2, dest: avahi-daemon.conf}
+            - {src: roles/arch_install/templates/avahi-daemon.conf.j2, dest: avahi-daemon.conf}
             - {src: roles/host_configuration/templates/snapper-root.j2, dest: snapper-root}
             - {src: roles/host_configuration/templates/snapper.conf.j2, dest: snapper.conf}
             - {src: roles/kubernetes_node/templates/20-kubernetes.conf.j2, dest: crio.conf}

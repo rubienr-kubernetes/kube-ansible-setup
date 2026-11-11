@@ -282,6 +282,7 @@
           - -K
           - /mnt
           - amd-ucode
+          - avahi
           - base
           - btrfs-progs
           - dosfstools
@@ -345,6 +346,14 @@
         - 10-cluster.link
         - 20-management.network
         - 20-cluster.network
+
+    - name: Configure first-boot IPv4 mDNS and workstation announcement
+      ansible.builtin.template:
+        src: avahi-daemon.conf.j2
+        dest: /mnt/etc/avahi/avahi-daemon.conf
+        owner: root
+        group: root
+        mode: '0644'
 
     - name: Create installed IPv4-only configuration directories
       ansible.builtin.file:
@@ -436,7 +445,7 @@
 
     - name: Enable installed services
       ansible.builtin.command:
-        argv: [arch-chroot, /mnt, systemctl, enable, sshd.service, systemd-networkd.service, systemd-resolved.service, systemd-timesyncd.service]
+        argv: [arch-chroot, /mnt, systemctl, enable, sshd.service, systemd-networkd.service, systemd-resolved.service, systemd-timesyncd.service, avahi-daemon.service]
       changed_when: true
 
     - name: Use installed systemd-resolved stub
@@ -649,6 +658,23 @@
   ansible.builtin.wait_for_connection:
     timeout: 600
   when: install_reboot | default(true) | bool
+
+- name: Verify first-boot mDNS service
+  when: install_reboot | default(true) | bool
+  block:
+    - name: Require Avahi enabled for subsequent boots
+      ansible.builtin.command:
+        argv: [systemctl, is-enabled, avahi-daemon.service]
+      changed_when: false
+
+    - name: Require Avahi running on the installed system
+      ansible.builtin.command:
+        argv: [systemctl, is-active, avahi-daemon.service]
+      changed_when: false
+      register: install_avahi_active
+      until: install_avahi_active.rc == 0
+      retries: 5
+      delay: 2
 
 - name: Verify installed boot and remove obsolete installer entries
   when: install_reboot | default(true) | bool
